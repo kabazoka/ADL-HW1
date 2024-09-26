@@ -1,8 +1,14 @@
 import json
 import torch
-from torch.utils.data import Dataset
-from transformers import T5Tokenizer, MT5ForConditionalGeneration, Trainer, TrainingArguments
+from torch.utils.data import Dataset, DataLoader
+from transformers import BertTokenizer, BertForMultipleChoice, get_scheduler
+from accelerate import Accelerator
+from tqdm.auto import tqdm
 import pandas as pd
+from itertools import chain
+from dataclasses import dataclass
+from typing import Union, Optional
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase, PaddingStrategy
 
 # Load the datasets
 with open('dataset/train.json', 'r', encoding='utf-8') as f:
@@ -15,8 +21,46 @@ with open('dataset/context.json', 'r', encoding='utf-8') as f:
     context_data = f.readlines()  # Each line is a paragraph
 
 # Tokenizer
-tokenizer = T5Tokenizer.from_pretrained("google/mt5-base")
+tokenizer = BertTokenizer.from_pretrained("bert-base-chinese")
 
+
+@dataclass
+class DataCollatorForMultipleChoice:
+    """
+    Data collator for dynamically padding the inputs for multiple choice.
+    """
+    tokenizer: PreTrainedTokenizerBase
+    padding: Union[bool, str, PaddingStrategy] = True
+    max_length: Optional[int] = 512
+    pad_to_multiple_of: Optional[int] = None
+
+    def __call__(self, features):
+        label_name = "label" if "label" in features[0].keys() else "labels"
+        labels = [feature.pop(label_name) for feature in features]
+        batch_size = len(features)
+        num_choices = len(features[0]["input_ids"])
+        flattened_features = [
+            [{k: v[i] for k, v in feature.items()} for i in range(num_choices)] for feature in features
+        ]
+        flattened_features = list(chain(*flattened_features))
+
+        # Ensure padding and truncation are applied here
+        batch = self.tokenizer.pad(
+            flattened_features,
+            padding=True,  # Make sure padding is enabled
+            max_length=self.max_length,  # Truncate to max_length=512
+            pad_to_multiple_of=self.pad_to_multiple_of,
+            return_tensors="pt",
+        )
+
+        # Un-flatten
+        batch = {k: v.view(batch_size, num_choices, -1) for k, v in batch.items()}
+        # Add back labels
+        batch["labels"] = torch.tensor(labels, dtype=torch.int64)
+        return batch
+
+
+# Dataset class for Multiple Choice tasks
 class MultipleChoiceDataset(Dataset):
     def __init__(self, data, context_data, tokenizer, max_len):
         self.data = data
@@ -32,25 +76,24 @@ class MultipleChoiceDataset(Dataset):
         question = item['question']
         paragraphs = [self.context_data[p].strip() for p in item['paragraphs']]  # Strip each paragraph
         relevant_paragraph = self.context_data[item['relevant']].strip()  # Strip relevant paragraph
-        
-        # Format input as question + paragraph
-        inputs = [f"question: {question} context: {paragraph}" for paragraph in paragraphs]
-        
-        # Tokenize the inputs
-        tokenized_inputs = self.tokenizer(
+
+        # First sentence: question
+        # Second sentence: paragraph options (multiple choices)
+        inputs = [f"{question} {paragraph}" for paragraph in paragraphs]
+
+        tokenized_inputs = tokenizer(
             inputs,
-            truncation=True,
-            max_length=self.max_len,    # 1024 max tokens for mT5
-            padding="max_length",       # Pad up to max length
-            return_tensors="pt"         # Return PyTorch tensors
+            truncation=True,  # Ensure truncation to max_len=512
+            max_length=self.max_len,  # Set max length to 512 for BERT
+            padding=True,  # Ensure padding is applied
+            return_tensors="pt"
         )
 
         try:
             relevant_idx = paragraphs.index(relevant_paragraph)  # Get index of relevant paragraph
         except ValueError:
-            # If index is not found, debug by printing or logging the issue
             print(f"Relevant paragraph not found for ID {item['id']}")
-            relevant_idx = -1  # Or handle this more gracefully depending on your needs
+            relevant_idx = -1
 
         return {
             'input_ids': tokenized_inputs['input_ids'],  # Shape: (num_choices, max_len)
@@ -60,41 +103,96 @@ class MultipleChoiceDataset(Dataset):
 
 
 # Instantiate the training and validation datasets
-train_dataset = MultipleChoiceDataset(train_data, context_data, tokenizer, max_len=1024)  # mT5 allows up to 1024 tokens
-valid_dataset = MultipleChoiceDataset(valid_data, context_data, tokenizer, max_len=1024)
+train_dataset = MultipleChoiceDataset(train_data, context_data, tokenizer, max_len=512)
+valid_dataset = MultipleChoiceDataset(valid_data, context_data, tokenizer, max_len=512)
+
+# Data Collator
+data_collator = DataCollatorForMultipleChoice(tokenizer=tokenizer, max_length=512)
+
+# DataLoader
+train_dataloader = DataLoader(train_dataset, batch_size=1, shuffle=True, collate_fn=data_collator)
+valid_dataloader = DataLoader(valid_dataset, batch_size=1, shuffle=False, collate_fn=data_collator)
 
 # Load Pretrained Model
-model = MT5ForConditionalGeneration.from_pretrained("google/mt5-base")
+model = BertForMultipleChoice.from_pretrained("bert-base-chinese")
 
-# Define Training Arguments
-training_args = TrainingArguments(
-    output_dir="./results",
-    learning_rate=3e-5,
-    per_device_train_batch_size=1,  # Effective batch size is 1*2 = 2
-    gradient_accumulation_steps=2,  # Accumulate gradients to simulate larger batch size
-    per_device_eval_batch_size=1,
-    num_train_epochs=1,
-    logging_dir='./logs',
-    logging_steps=10,
-    evaluation_strategy="epoch"
+# Initialize Accelerator
+accelerator = Accelerator()
+
+# Prepare the model, optimizer, and dataloaders for the correct device placement
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-5)
+
+# Use a scheduler for learning rate decay
+lr_scheduler = get_scheduler(
+    "linear", optimizer=optimizer, num_warmup_steps=0, num_training_steps=len(train_dataloader)
 )
 
-# Define Trainer
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=valid_dataset,
+# Move model, optimizer, and data to the correct device
+model, optimizer, train_dataloader, valid_dataloader, lr_scheduler = accelerator.prepare(
+    model, optimizer, train_dataloader, valid_dataloader, lr_scheduler
 )
 
-# Train the model
-trainer.train()
+# Variables to track losses for learning curve visualization
+train_losses = []
+valid_losses = []
+
+# Training loop
+num_epochs = 1
+progress_bar = tqdm(range(num_epochs * len(train_dataloader)), disable=not accelerator.is_local_main_process)
+
+model.train()
+for epoch in range(num_epochs):
+    total_train_loss = 0
+    for step, batch in enumerate(train_dataloader):
+        outputs = model(**batch)
+        loss = outputs.loss
+        total_train_loss += loss.item()
+        accelerator.backward(loss)
+
+        optimizer.step()
+        lr_scheduler.step()
+        optimizer.zero_grad()
+
+        progress_bar.update(1)
+
+    # Calculate average training loss for the epoch
+    avg_train_loss = total_train_loss / len(train_dataloader)
+    train_losses.append(avg_train_loss)
+    print(f"Epoch {epoch} finished with average training loss: {avg_train_loss}")
+
+    # Evaluate on the validation set after each epoch
+    model.eval()
+    total_valid_loss = 0
+    with torch.no_grad():
+        for step, batch in enumerate(valid_dataloader):
+            outputs = model(**batch)
+            loss = outputs.loss
+            total_valid_loss += loss.item()
+
+    avg_valid_loss = total_valid_loss / len(valid_dataloader)
+    valid_losses.append(avg_valid_loss)
+    print(f"Epoch {epoch} finished with average validation loss: {avg_valid_loss}")
+
+    model.train()  # Switch back to training mode
 
 # Save model and tokenizer
-model.save_pretrained("./paragraph_selection_model")
+accelerator.wait_for_everyone()
+unwrapped_model = accelerator.unwrap_model(model)
+unwrapped_model.save_pretrained("./paragraph_selection_model")
 tokenizer.save_pretrained("./paragraph_selection_model")
 
 print(f"Model and tokenizer saved to ./paragraph_selection_model")
+
+# Plot the learning curves
+import matplotlib.pyplot as plt
+
+plt.plot(train_losses, label="Training Loss")
+plt.plot(valid_losses, label="Validation Loss")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.title("Learning Curve")
+plt.legend()
+plt.show()
 
 # Evaluate and output predictions for the test set
 with open('dataset/test.json', 'r', encoding='utf-8') as f:
@@ -116,14 +214,13 @@ class TestDataset(Dataset):
         question = item['question']
         paragraphs = [self.context_data[p].strip() for p in item['paragraphs']]
 
-        inputs = [f"question: {question} context: {paragraph}" for paragraph in paragraphs]
+        inputs = [f"{question} {paragraph}" for paragraph in paragraphs]
 
-        # Tokenize the inputs
-        tokenized_inputs = self.tokenizer(
+        tokenized_inputs = tokenizer(
             inputs,
             truncation=True,  # Truncate paragraphs if they are too long
             max_length=self.max_len,
-            padding="max_length",
+            padding=True,  # Ensure padding is applied
             return_tensors="pt"
         )
 
@@ -134,14 +231,22 @@ class TestDataset(Dataset):
         }
 
 # Prepare test dataset
-test_dataset = TestDataset(test_data, context_data, tokenizer, max_len=1024)
+test_dataset = TestDataset(test_data, context_data, tokenizer, max_len=512)
+test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False, collate_fn=data_collator)
 
-# Make predictions
-predictions = trainer.predict(test_dataset)
+# Model evaluation
+model.eval()
+all_predictions = []
+test_progress_bar = tqdm(test_dataloader, disable=not accelerator.is_local_main_process)
+for batch in test_progress_bar:
+    with torch.no_grad():
+        outputs = model(**batch)
+        predictions = outputs.logits.argmax(dim=-1)
+        all_predictions.extend(predictions.cpu().numpy())
 
 # Output predictions to CSV
 test_ids = [item['id'] for item in test_data]
-predicted_relevant = predictions.predictions.argmax(axis=-1)  # Get the best paragraph index
+predicted_relevant = all_predictions  # Get the best paragraph index
 
 submission = pd.DataFrame({
     'id': test_ids,
