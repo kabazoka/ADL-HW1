@@ -1,7 +1,7 @@
 import json
 import torch
 from torch.utils.data import Dataset
-from transformers import BertTokenizer, BertForMultipleChoice, Trainer, TrainingArguments
+from transformers import T5Tokenizer, MT5ForConditionalGeneration, Trainer, TrainingArguments
 import pandas as pd
 
 # Load the datasets
@@ -15,7 +15,7 @@ with open('dataset/context.json', 'r', encoding='utf-8') as f:
     context_data = f.readlines()  # Each line is a paragraph
 
 # Tokenizer
-tokenizer = BertTokenizer.from_pretrained("bert-base-chinese")
+tokenizer = T5Tokenizer.from_pretrained("google/mt5-base")
 
 class MultipleChoiceDataset(Dataset):
     def __init__(self, data, context_data, tokenizer, max_len):
@@ -33,12 +33,14 @@ class MultipleChoiceDataset(Dataset):
         paragraphs = [self.context_data[p].strip() for p in item['paragraphs']]  # Strip each paragraph
         relevant_paragraph = self.context_data[item['relevant']].strip()  # Strip relevant paragraph
         
-        # Tokenize the question + paragraph pairs
-        inputs = self.tokenizer(
-            [question] * len(paragraphs),  # Repeat the question for each paragraph
-            paragraphs,
-            truncation='only_second',  # Prioritize truncating the paragraph, not the question
-            max_length=self.max_len,    # 512 max tokens
+        # Format input as question + paragraph
+        inputs = [f"question: {question} context: {paragraph}" for paragraph in paragraphs]
+        
+        # Tokenize the inputs
+        tokenized_inputs = self.tokenizer(
+            inputs,
+            truncation=True,
+            max_length=self.max_len,    # 1024 max tokens for mT5
             padding="max_length",       # Pad up to max length
             return_tensors="pt"         # Return PyTorch tensors
         )
@@ -51,18 +53,18 @@ class MultipleChoiceDataset(Dataset):
             relevant_idx = -1  # Or handle this more gracefully depending on your needs
 
         return {
-            'input_ids': inputs['input_ids'].squeeze(0),  # Shape: (num_choices, max_len)
-            'attention_mask': inputs['attention_mask'].squeeze(0),
+            'input_ids': tokenized_inputs['input_ids'],  # Shape: (num_choices, max_len)
+            'attention_mask': tokenized_inputs['attention_mask'],
             'labels': torch.tensor(relevant_idx, dtype=torch.long)  # Use the index of the relevant paragraph
         }
 
 
 # Instantiate the training and validation datasets
-train_dataset = MultipleChoiceDataset(train_data, context_data, tokenizer, max_len=512)
-valid_dataset = MultipleChoiceDataset(valid_data, context_data, tokenizer, max_len=512)
+train_dataset = MultipleChoiceDataset(train_data, context_data, tokenizer, max_len=1024)  # mT5 allows up to 1024 tokens
+valid_dataset = MultipleChoiceDataset(valid_data, context_data, tokenizer, max_len=1024)
 
 # Load Pretrained Model
-model = BertForMultipleChoice.from_pretrained("bert-base-chinese")
+model = MT5ForConditionalGeneration.from_pretrained("google/mt5-base")
 
 # Define Training Arguments
 training_args = TrainingArguments(
@@ -88,7 +90,7 @@ trainer = Trainer(
 # Train the model
 trainer.train()
 
-
+# Save model and tokenizer
 model.save_pretrained("./paragraph_selection_model")
 tokenizer.save_pretrained("./paragraph_selection_model")
 
@@ -114,23 +116,25 @@ class TestDataset(Dataset):
         question = item['question']
         paragraphs = [self.context_data[p].strip() for p in item['paragraphs']]
 
-        inputs = self.tokenizer(
-            [question] * len(paragraphs),
-            paragraphs,
-            truncation='only_second',  # Truncate paragraphs if they are too long
+        inputs = [f"question: {question} context: {paragraph}" for paragraph in paragraphs]
+
+        # Tokenize the inputs
+        tokenized_inputs = self.tokenizer(
+            inputs,
+            truncation=True,  # Truncate paragraphs if they are too long
             max_length=self.max_len,
             padding="max_length",
             return_tensors="pt"
         )
 
         return {
-            'input_ids': inputs['input_ids'].squeeze(0),
-            'attention_mask': inputs['attention_mask'].squeeze(0),
+            'input_ids': tokenized_inputs['input_ids'],
+            'attention_mask': tokenized_inputs['attention_mask'],
             'id': item['id']
         }
 
 # Prepare test dataset
-test_dataset = TestDataset(test_data, context_data, tokenizer, max_len=512)
+test_dataset = TestDataset(test_data, context_data, tokenizer, max_len=1024)
 
 # Make predictions
 predictions = trainer.predict(test_dataset)
