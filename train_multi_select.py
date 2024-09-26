@@ -85,9 +85,15 @@ class MultipleChoiceDataset(Dataset):
             inputs,
             truncation=True,  # Ensure truncation to max_len=512
             max_length=self.max_len,  # Set max length to 512 for BERT
-            padding=True,  # Ensure padding is applied
+            padding='max_length',  # Ensure padding is applied
             return_tensors="pt"
         )
+
+        # Check if any tokenized input exceeds the max length of 512 tokens
+        input_lengths = [len(ids) for ids in tokenized_inputs['input_ids']]
+        for i, length in enumerate(input_lengths):
+            if length > 512:
+                print(f"Warning: Tokenized input {i} exceeds 512 tokens. Length: {length}")
 
         try:
             relevant_idx = paragraphs.index(relevant_paragraph)  # Get index of relevant paragraph
@@ -100,7 +106,6 @@ class MultipleChoiceDataset(Dataset):
             'attention_mask': tokenized_inputs['attention_mask'],
             'labels': torch.tensor(relevant_idx, dtype=torch.long)  # Use the index of the relevant paragraph
         }
-
 
 # Instantiate the training and validation datasets
 train_dataset = MultipleChoiceDataset(train_data, context_data, tokenizer, max_len=512)
