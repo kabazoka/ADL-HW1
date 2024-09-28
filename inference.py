@@ -122,6 +122,13 @@ def predict_and_save_csv(paragraph_selection_model, span_prediction_model, token
             # Join tokens without spaces, remove '##'
             predicted_answer = ''.join(cleaned_tokens).replace('##', '')
 
+            if predicted_answer == '':
+                print(f"No answer found for question: {question}")
+                print(f"    Selected Paragraph: {selected_paragraph}")
+                print(f"    Start Index: {start_idx}, End Index: {end_idx}")
+                print(f"    Tokens: {tokens}")
+                print(f"    Cleaned Tokens: {cleaned_tokens}")
+
             # Append the id and the predicted answer to predictions
             predictions.append({
                 'id': example_id,

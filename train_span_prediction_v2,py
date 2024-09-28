@@ -1,0 +1,179 @@
+import json
+import os
+import torch
+from torch.utils.data import DataLoader
+from transformers import (
+    BertTokenizerFast, BertForQuestionAnswering, get_scheduler, DataCollatorWithPadding,
+    AutoTokenizer, AutoModelForQuestionAnswering, default_data_collator
+)
+from accelerate import Accelerator
+from tqdm.auto import tqdm
+from sample_code.utils_qa import postprocess_qa_predictions  # Postprocessing from Hugging Face
+
+# Custom dataset class
+class QAWithParagraphSelectionDataset(torch.utils.data.Dataset):
+    def __init__(self, data, context_data, tokenizer, max_len):
+        self.data = data
+        self.context_data = context_data
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+        self.preprocessed_data = self._preprocess()
+
+    def _preprocess(self):
+        preprocessed = []
+        for item in tqdm(self.data, desc="Processing Dataset", unit="samples"):
+            question = item['question']
+            relevant_paragraph = self.context_data[item['relevant']].strip()
+            answer_text = item['answer']['text']
+            answer_start = item['answer']['start']
+
+            # Tokenize question and relevant paragraph
+            inputs = self.tokenizer(
+                question,
+                relevant_paragraph,
+                truncation=True,
+                max_length=self.max_len,
+                padding="max_length",
+                return_offsets_mapping=True,
+                return_tensors="pt"
+            )
+
+            input_ids = inputs['input_ids'].squeeze(0)
+            attention_mask = inputs['attention_mask'].squeeze(0)
+            offset_mapping = inputs['offset_mapping'].squeeze(0)
+
+            # Find start and end token positions for the answer
+            start_position, end_position = None, None
+            for idx, (start, end) in enumerate(offset_mapping):
+                if start <= answer_start < end:
+                    start_position = idx
+                if start < answer_start + len(answer_text) <= end:
+                    end_position = idx
+            if start_position is None or end_position is None:
+                start_position, end_position = 0, 0
+
+            preprocessed.append({
+                'input_ids': input_ids,
+                'attention_mask': attention_mask,
+                'start_positions': torch.tensor(start_position, dtype=torch.long),
+                'end_positions': torch.tensor(end_position, dtype=torch.long)
+            })
+
+        return preprocessed
+
+    def __len__(self):
+        return len(self.preprocessed_data)
+
+    def __getitem__(self, idx):
+        return self.preprocessed_data[idx]
+
+# Dataset loading function
+def load_json(filepath):
+    with open(filepath, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+# Training function with checkpointing and evaluation
+def train_and_evaluate(
+        train_file, valid_file, context_file, model_name_or_path, output_dir, 
+        learning_rate=3e-5, num_epochs=3, batch_size=4, max_len=512, mixed_precision="fp16"):
+    
+    # Load datasets
+    train_data = load_json(train_file)
+    valid_data = load_json(valid_file)
+    context_data = load_json(context_file)
+    
+    # Load tokenizer and model
+    tokenizer = BertTokenizerFast.from_pretrained(model_name_or_path)
+    model = BertForQuestionAnswering.from_pretrained(model_name_or_path)
+    
+    # Create datasets
+    train_dataset = QAWithParagraphSelectionDataset(train_data, context_data, tokenizer, max_len=max_len)
+    valid_dataset = QAWithParagraphSelectionDataset(valid_data, context_data, tokenizer, max_len=max_len)
+    
+    # Initialize Accelerator
+    accelerator = Accelerator(mixed_precision=mixed_precision)
+
+    # DataLoader with dynamic padding using DataCollatorWithPadding
+    data_collator = DataCollatorWithPadding(tokenizer)
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=data_collator)
+    valid_dataloader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False, collate_fn=data_collator)
+
+    # Optimizer and Scheduler
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    num_training_steps = num_epochs * len(train_dataloader)
+    lr_scheduler = get_scheduler("linear", optimizer=optimizer, num_warmup_steps=500, num_training_steps=num_training_steps)
+
+    # Prepare model, dataloaders, and optimizer with accelerator
+    model, optimizer, train_dataloader, valid_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, valid_dataloader, lr_scheduler
+    )
+
+    # Training loop
+    best_val_loss = float("inf")
+    progress_bar = tqdm(range(num_training_steps))
+
+    for epoch in range(num_epochs):
+        model.train()
+        total_loss = 0
+        for batch in train_dataloader:
+            outputs = model(**batch)
+            loss = outputs.loss
+            total_loss += loss.item()
+            accelerator.backward(loss)
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
+            progress_bar.update(1)
+
+        avg_train_loss = total_loss / len(train_dataloader)
+        print(f"Epoch {epoch+1} finished with average training loss: {avg_train_loss}")
+
+        # Validation phase
+        model.eval()
+        total_val_loss = 0
+        correct_start_preds, correct_end_preds, total_predictions = 0, 0, 0
+        for batch in valid_dataloader:
+            with torch.no_grad():
+                outputs = model(**batch)
+                val_loss = outputs.loss
+                total_val_loss += val_loss.item()
+
+                start_preds = torch.argmax(outputs.start_logits, dim=-1)
+                end_preds = torch.argmax(outputs.end_logits, dim=-1)
+
+                correct_start_preds += (start_preds == batch['start_positions']).sum().item()
+                correct_end_preds += (end_preds == batch['end_positions']).sum().item()
+                total_predictions += batch['start_positions'].size(0)
+
+        avg_val_loss = total_val_loss / len(valid_dataloader)
+        start_accuracy = correct_start_preds / total_predictions * 100
+        end_accuracy = correct_end_preds / total_predictions * 100
+
+        print(f"Validation Loss after Epoch {epoch+1}: {avg_val_loss}")
+        print(f"Start Position Accuracy: {start_accuracy:.2f}%")
+        print(f"End Position Accuracy: {end_accuracy:.2f}%")
+
+        # Checkpointing if validation loss improves
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            accelerator.wait_for_everyone()
+            unwrapped_model = accelerator.unwrap_model(model)
+            unwrapped_model.save_pretrained(output_dir)
+            tokenizer.save_pretrained(output_dir)
+            print(f"Best model saved with validation loss: {best_val_loss}")
+
+        model.train()
+
+# Example usage
+train_and_evaluate(
+    train_file='dataset/train.json',
+    valid_file='dataset/valid.json',
+    context_file='dataset/context.json',
+    model_name_or_path="bert-base-chinese",
+    output_dir="./span_prediction_model",
+    learning_rate=3e-5,
+    num_epochs=3,
+    batch_size=4,
+    max_len=512,
+    mixed_precision="fp16"
+)

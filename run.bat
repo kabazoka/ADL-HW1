@@ -16,17 +16,17 @@ set SPAN_MODEL_DIR=span_prediction_model
 
 REM Step 1: Train the paragraph selection model
 echo Training paragraph selection model...
-python train_multi_select.py --output_dir "%PARAGRAPH_MODEL_DIR%"
+C:/Users/kabaz_kwuenmy/.conda/envs/yolov8/python.exe  train_multi_select.py --output_dir "%PARAGRAPH_MODEL_DIR%"
 if %ERRORLEVEL% neq 0 exit /b %ERRORLEVEL%
 
 REM Step 2: Train the span prediction model
 echo Training span prediction model...
-python train_span_selection.py --output_dir "%SPAN_MODEL_DIR%"
+C:/Users/kabaz_kwuenmy/.conda/envs/yolov8/python.exe  train_span_prediction.py --output_dir "%SPAN_MODEL_DIR%"
 if %ERRORLEVEL% neq 0 exit /b %ERRORLEVEL%
 
 REM Step 3: Run inference
 echo Running inference...
-python inference.py "%CONTEXT_PATH%" "%TEST_PATH%" "%OUTPUT_PATH%"
+C:/Users/kabaz_kwuenmy/.conda/envs/yolov8/python.exe  inference.py "%CONTEXT_PATH%" "%TEST_PATH%" "%OUTPUT_PATH%"
 if %ERRORLEVEL% neq 0 exit /b %ERRORLEVEL%
 
 echo Inference complete. Predictions saved to "%OUTPUT_PATH%"
