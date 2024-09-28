@@ -9,6 +9,7 @@ from itertools import chain
 from dataclasses import dataclass
 from typing import Union, Optional
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase, PaddingStrategy
+import matplotlib.pyplot as plt
 
 # Load the datasets
 with open('dataset/train.json', 'r', encoding='utf-8') as f:
@@ -18,11 +19,10 @@ with open('dataset/valid.json', 'r', encoding='utf-8') as f:
     valid_data = json.load(f)
 
 with open('dataset/context.json', 'r', encoding='utf-8') as f:
-    context_data = f.readlines()  # Each line is a paragraph
+    context_data = json.load(f)
 
 # Tokenizer
 tokenizer = BertTokenizer.from_pretrained("bert-base-chinese")
-
 
 @dataclass
 class DataCollatorForMultipleChoice:
@@ -77,29 +77,30 @@ class MultipleChoiceDataset(Dataset):
         paragraphs = [self.context_data[p].strip() for p in item['paragraphs']]  # Strip each paragraph
         relevant_paragraph = self.context_data[item['relevant']].strip()  # Strip relevant paragraph
 
-        # First sentence: question
-        # Second sentence: paragraph options (multiple choices)
+        # Combine question with each paragraph (multiple choices)
         inputs = [f"{question} {paragraph}" for paragraph in paragraphs]
 
-        tokenized_inputs = tokenizer(
+        # Tokenize with truncation and padding applied
+        tokenized_inputs = self.tokenizer(
             inputs,
             truncation=True,  # Ensure truncation to max_len=512
             max_length=self.max_len,  # Set max length to 512 for BERT
-            padding='max_length',  # Ensure padding is applied
-            return_tensors="pt"
+            padding=True,  # Ensure padding to max length
+            return_tensors="pt"  # Return PyTorch tensors
         )
 
-        # Check if any tokenized input exceeds the max length of 512 tokens
+        # Optionally check the input lengths (not really needed with truncation=True)
         input_lengths = [len(ids) for ids in tokenized_inputs['input_ids']]
         for i, length in enumerate(input_lengths):
             if length > 512:
                 print(f"Warning: Tokenized input {i} exceeds 512 tokens. Length: {length}")
 
+        # Find the relevant paragraph index
         try:
             relevant_idx = paragraphs.index(relevant_paragraph)  # Get index of relevant paragraph
         except ValueError:
             print(f"Relevant paragraph not found for ID {item['id']}")
-            relevant_idx = -1
+            relevant_idx = -1  # Handle the missing relevant index case
 
         return {
             'input_ids': tokenized_inputs['input_ids'],  # Shape: (num_choices, max_len)
@@ -137,17 +138,19 @@ model, optimizer, train_dataloader, valid_dataloader, lr_scheduler = accelerator
     model, optimizer, train_dataloader, valid_dataloader, lr_scheduler
 )
 
+
 # Variables to track losses for learning curve visualization
 train_losses = []
 valid_losses = []
 
 # Training loop
-num_epochs = 1
+num_epochs = 1 
 progress_bar = tqdm(range(num_epochs * len(train_dataloader)), disable=not accelerator.is_local_main_process)
 
 model.train()
 for epoch in range(num_epochs):
     total_train_loss = 0
+    model.train()  # Set the model to training mode
     for step, batch in enumerate(train_dataloader):
         outputs = model(**batch)
         loss = outputs.loss
@@ -163,10 +166,13 @@ for epoch in range(num_epochs):
     # Calculate average training loss for the epoch
     avg_train_loss = total_train_loss / len(train_dataloader)
     train_losses.append(avg_train_loss)
-    print(f"Epoch {epoch} finished with average training loss: {avg_train_loss}")
+    print(f"Epoch {epoch+1} finished with average training loss: {avg_train_loss}")
+
+    correct_predictions = 0
+    total_predictions = 0
 
     # Evaluate on the validation set after each epoch
-    model.eval()
+    model.eval()  # Set the model to evaluation mode
     total_valid_loss = 0
     with torch.no_grad():
         for step, batch in enumerate(valid_dataloader):
@@ -174,11 +180,19 @@ for epoch in range(num_epochs):
             loss = outputs.loss
             total_valid_loss += loss.item()
 
-    avg_valid_loss = total_valid_loss / len(valid_dataloader)
-    valid_losses.append(avg_valid_loss)
-    print(f"Epoch {epoch} finished with average validation loss: {avg_valid_loss}")
+            # Get model predictions (index of the highest score/logits)
+            predictions = torch.argmax(outputs.logits, dim=-1)
 
-    model.train()  # Switch back to training mode
+            # Compare predictions to ground truth labels
+            correct_predictions += (predictions == batch['labels']).sum().item()
+            total_predictions += predictions.size(0)
+
+    # Calculate accuracy
+    accuracy = correct_predictions / total_predictions * 100
+    avg_valid_loss = total_valid_loss / len(valid_dataloader)
+
+    print(f"Validation Accuracy: {accuracy:.2f}%")
+    print(f"Average validation loss: {avg_valid_loss:.4f}")
 
 # Save model and tokenizer
 accelerator.wait_for_everyone()
@@ -187,78 +201,3 @@ unwrapped_model.save_pretrained("./paragraph_selection_model")
 tokenizer.save_pretrained("./paragraph_selection_model")
 
 print(f"Model and tokenizer saved to ./paragraph_selection_model")
-
-# Plot the learning curves
-import matplotlib.pyplot as plt
-
-plt.plot(train_losses, label="Training Loss")
-plt.plot(valid_losses, label="Validation Loss")
-plt.xlabel("Epoch")
-plt.ylabel("Loss")
-plt.title("Learning Curve")
-plt.legend()
-plt.show()
-
-# Evaluate and output predictions for the test set
-with open('dataset/test.json', 'r', encoding='utf-8') as f:
-    test_data = json.load(f)
-
-# Modify dataset class for test without labels
-class TestDataset(Dataset):
-    def __init__(self, data, context_data, tokenizer, max_len):
-        self.data = data
-        self.context_data = context_data
-        self.tokenizer = tokenizer
-        self.max_len = max_len
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        item = self.data[idx]
-        question = item['question']
-        paragraphs = [self.context_data[p].strip() for p in item['paragraphs']]
-
-        inputs = [f"{question} {paragraph}" for paragraph in paragraphs]
-
-        tokenized_inputs = tokenizer(
-            inputs,
-            truncation=True,  # Truncate paragraphs if they are too long
-            max_length=self.max_len,
-            padding=True,  # Ensure padding is applied
-            return_tensors="pt"
-        )
-
-        return {
-            'input_ids': tokenized_inputs['input_ids'],
-            'attention_mask': tokenized_inputs['attention_mask'],
-            'id': item['id']
-        }
-
-# Prepare test dataset
-test_dataset = TestDataset(test_data, context_data, tokenizer, max_len=512)
-test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False, collate_fn=data_collator)
-
-# Model evaluation
-model.eval()
-all_predictions = []
-test_progress_bar = tqdm(test_dataloader, disable=not accelerator.is_local_main_process)
-for batch in test_progress_bar:
-    with torch.no_grad():
-        outputs = model(**batch)
-        predictions = outputs.logits.argmax(dim=-1)
-        all_predictions.extend(predictions.cpu().numpy())
-
-# Output predictions to CSV
-test_ids = [item['id'] for item in test_data]
-predicted_relevant = all_predictions  # Get the best paragraph index
-
-submission = pd.DataFrame({
-    'id': test_ids,
-    'relevant': predicted_relevant
-})
-
-# Save to CSV
-submission.to_csv('submission.csv', index=False)
-
-print("Predictions saved to submission.csv")
