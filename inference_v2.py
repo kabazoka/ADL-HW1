@@ -125,8 +125,8 @@ def run_inference(test_file, context_file, paragraph_selection_model_path, span_
         answer = ''.join(cleaned_tokens).replace('##', '')
         print(f"Question: {question}, Answer: {answer}, Start: {start_idx}, End: {end_idx}")
         results.append({
-            "id": question_id,  # Include the question ID in the results
-            "answer": answer,
+            'id': question_id,  # Include the question ID in the results
+            'answer': answer,
         })
 
     # Convert predictions to a pandas DataFrame and save as CSV
