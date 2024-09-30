@@ -51,7 +51,7 @@ class TestQADataset(torch.utils.data.Dataset):
 
 # Function to remove special tokens like [CLS], [SEP], and [PAD]
 def remove_special_tokens(tokens):
-    return [token for token in tokens if token not in ['[CLS]', '[SEP]', '[PAD]']]
+    return [token for token in tokens if token not in ['[CLS]', '[SEP]', '[PAD]', '[UNK]']]
 
 # Inference function for paragraph selection and span prediction
 def run_inference(test_file, context_file, paragraph_selection_model_path, span_prediction_model_path, output_file, max_len=512, batch_size=1):

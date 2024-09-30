@@ -28,11 +28,32 @@ class QAWithParagraphSelectionDataset(torch.utils.data.Dataset):
             answer_text = item['answer']['text']
             answer_start = item['answer']['start']
 
-            # Tokenize question and relevant paragraph
+            # Tokenize context separately to find the start and end positions
+            tokenized_context = self.tokenizer(
+                relevant_paragraph,
+                add_special_tokens=False,
+                return_offsets_mapping=True
+            )
+            context_offsets = tokenized_context['offset_mapping']
+            context_input_ids = tokenized_context['input_ids']
+
+            # Find start and end token positions in the context
+            start_position, end_position = None, None
+            for idx_tok, (start, end) in enumerate(context_offsets):
+                if start <= answer_start < end:
+                    start_position = idx_tok
+                if start <= answer_start + len(answer_text) <= end:
+                    end_position = idx_tok
+            if start_position is None:
+                start_position = 0
+            if end_position is None:
+                end_position = len(context_offsets) - 1
+
+            # Tokenize question and context together
             inputs = self.tokenizer(
                 question,
                 relevant_paragraph,
-                truncation=True,
+                truncation='only_second',
                 max_length=self.max_len,
                 padding="max_length",
                 return_offsets_mapping=True,
@@ -43,22 +64,34 @@ class QAWithParagraphSelectionDataset(torch.utils.data.Dataset):
             attention_mask = inputs['attention_mask'].squeeze(0)
             offset_mapping = inputs['offset_mapping'].squeeze(0)
 
-            # Find start and end token positions for the answer
-            start_position, end_position = None, None
-            for idx_tok, (start, end) in enumerate(offset_mapping):
-                if start <= answer_start < end:
-                    start_position = idx_tok
-                if start < answer_start + len(answer_text) <= end:
-                    end_position = idx_tok
-            if start_position is None or end_position is None:
-                start_position, end_position = 0, 0
+            # Adjust offset mapping: set offsets to (0, 0) for question and special tokens
+            sequence_ids = inputs.sequence_ids()
+            adjusted_offset_mapping = []
+            context_start = None
+            for idx_offset, (offset, seq_id) in enumerate(zip(offset_mapping, sequence_ids)):
+                if seq_id == 1:
+                    if context_start is None:
+                        context_start = idx_offset
+                    adjusted_offset_mapping.append((offset[0].item(), offset[1].item()))
+                else:
+                    adjusted_offset_mapping.append((0, 0))
+
+            # Adjust start and end positions
+            start_position += context_start
+            end_position += context_start
+
+            # Ensure that the positions are within the valid range
+            if start_position >= self.max_len:
+                start_position = self.max_len - 1
+            if end_position >= self.max_len:
+                end_position = self.max_len - 1
 
             preprocessed.append({
                 'input_ids': input_ids,
                 'attention_mask': attention_mask,
                 'start_positions': torch.tensor(start_position, dtype=torch.long),
                 'end_positions': torch.tensor(end_position, dtype=torch.long),
-                'offset_mapping': offset_mapping,
+                'offset_mapping': torch.tensor(adjusted_offset_mapping),
                 'context': relevant_paragraph,
                 'question': question,
                 'answer_text': answer_text,
@@ -103,7 +136,7 @@ def train_and_evaluate(
     context_data = load_json(context_file)
     
     # Load tokenizer and model
-    tokenizer = BertTokenizerFast.from_pretrained(model_name_or_path)
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
     model = BertForQuestionAnswering.from_pretrained(model_name_or_path)
     
     # Create datasets
@@ -226,6 +259,9 @@ def train_and_evaluate(
                     exact_match_total += exact_match
                     f1_total += f1
                     total_predictions += 1
+                    # Print predicted and ground truth answers
+                    print(f"Ground Truth: {ground_truth}")
+                    print(f"Predicted Answer: {predicted_answer}")
 
         avg_val_loss = total_val_loss / len(valid_dataloader)
         exact_match_score = exact_match_total / total_predictions * 100
