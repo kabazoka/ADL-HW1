@@ -102,6 +102,12 @@ class MultipleChoiceDataset(Dataset):
             print(f"Relevant paragraph not found for ID {item['id']}")
             relevant_idx = -1  # Handle the missing relevant index case
 
+        if (model.training == False):
+            print(f"Question: {question}")
+            print(f"Relevant Index: {relevant_idx}")
+            print(f"Inputs: {inputs}")
+            print(f"labels: {relevant_idx}")
+
         return {
             'input_ids': tokenized_inputs['input_ids'],  # Shape: (num_choices, max_len)
             'attention_mask': tokenized_inputs['attention_mask'],
@@ -144,7 +150,7 @@ train_losses = []
 valid_losses = []
 
 # Training loop
-num_epochs = 1 
+num_epochs = 1
 progress_bar = tqdm(range(num_epochs * len(train_dataloader)), disable=not accelerator.is_local_main_process)
 
 model.train()

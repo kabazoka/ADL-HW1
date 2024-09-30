@@ -1,145 +1,149 @@
 import json
 import torch
+from transformers import BertTokenizerFast, BertForQuestionAnswering
 from torch.utils.data import DataLoader
-from transformers import BertTokenizerFast, BertForMultipleChoice, BertForQuestionAnswering
-import pandas as pd
 from tqdm.auto import tqdm
+from sample_code.utils_qa import postprocess_qa_predictions  # For post-processing predictions
+import pandas as pd
 
-# Set the device (GPU if available, otherwise CPU)
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-# Load saved models and tokenizer
-paragraph_selection_model = BertForMultipleChoice.from_pretrained("./paragraph_selection_model").to(device)
-span_prediction_model = BertForQuestionAnswering.from_pretrained("./span_prediction_model").to(device)
-tokenizer = BertTokenizerFast.from_pretrained("./paragraph_selection_model")
-
-# Load the context and test files
-context_file = 'dataset/context.json'  # Replace with your actual context file path
-test_file = 'dataset/test.json'  # Replace with your actual test file path
-
-with open(context_file, 'r', encoding='utf-8') as f:
-    context_data = json.load(f)
-
-with open(test_file, 'r', encoding='utf-8') as f:
-    test_data = json.load(f)
-
-# Define the Test Dataset class
-class TestDataset(torch.utils.data.Dataset):
-    def __init__(self, data, context_data, tokenizer, max_len=512):
+# Custom dataset class for test data
+class TestQADataset(torch.utils.data.Dataset):
+    def __init__(self, data, context_data, tokenizer, max_len):
         self.data = data
         self.context_data = context_data
         self.tokenizer = tokenizer
         self.max_len = max_len
+        self.preprocessed_data = self._preprocess()
+
+    def _preprocess(self):
+        preprocessed = []
+        for item in tqdm(self.data, desc="Processing Test Dataset", unit="samples"):
+            question_id = item['id']
+            question = item['question']
+            paragraphs = [self.context_data[p].strip() for p in item['paragraphs']]
+
+            # Tokenize the question and all paragraphs
+            tokenized_paragraphs = [
+                self.tokenizer(
+                    question,
+                    paragraph,
+                    truncation=True,
+                    max_length=self.max_len,
+                    padding="max_length",
+                    return_tensors="pt"
+                )
+                for paragraph in paragraphs
+            ]
+            preprocessed.append({
+                'id': question_id,  # Add question ID here
+                'question': question,
+                'paragraphs': paragraphs,
+                'tokenized_paragraphs': tokenized_paragraphs,
+                'paragraph_ids': item['paragraphs']
+            })
+        return preprocessed
 
     def __len__(self):
-        return len(self.data)
+        return len(self.preprocessed_data)
 
     def __getitem__(self, idx):
-        item = self.data[idx]
-        question = item['question']
-        
-        # Fetch the paragraphs corresponding to the paragraph indices from context.json
-        paragraphs = [self.context_data[p].strip() for p in item['paragraphs']]
-
-        # Tokenize the question with each of the paragraphs
-        inputs = self.tokenizer(
-            [question] * len(paragraphs),  # Repeat the question for each paragraph
-            paragraphs,                    # Candidate paragraphs
-            truncation=True,               # Truncate if needed
-            max_length=self.max_len,        # Ensure max length of 512 tokens
-            padding="max_length",           # Pad to max length
-            return_tensors="pt"             # Return tensors
-        )
-
-        return {
-            'input_ids': inputs['input_ids'].unsqueeze(0).to(device),  # Shape: (1, num_paragraphs, max_len)
-            'attention_mask': inputs['attention_mask'].unsqueeze(0).to(device),  # Shape: (1, num_paragraphs, max_len)
-            'paragraphs': paragraphs,  # Keep track of the paragraphs
-            'id': item['id'],
-            'question': question
-        }
-
-# Prepare the test dataset
-test_dataset = TestDataset(test_data, context_data, tokenizer)
+        return self.preprocessed_data[idx]
 
 # Function to remove special tokens like [CLS], [SEP], and [PAD]
 def remove_special_tokens(tokens):
     return [token for token in tokens if token not in ['[CLS]', '[SEP]', '[PAD]']]
 
-# Prediction function to extract the relevant paragraph and then predict the span
-def predict_and_save_csv(paragraph_selection_model, span_prediction_model, tokenizer, test_dataset, output_file):
-    # Create DataLoader
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+# Inference function for paragraph selection and span prediction
+def run_inference(test_file, context_file, paragraph_selection_model_path, span_prediction_model_path, output_file, max_len=512, batch_size=1):
+    # Load the test dataset and context
+    with open(test_file, 'r', encoding='utf-8') as f:
+        test_data = json.load(f)
 
-    predictions = []
-    
-    paragraph_selection_model.eval()  # Set paragraph selection model to evaluation mode
-    span_prediction_model.eval()  # Set span prediction model to evaluation mode
-    with torch.no_grad():  # No need to compute gradients during inference
-        for batch in tqdm(test_loader):
-            input_ids = batch['input_ids']  # Shape: (1, num_paragraphs, max_len)
-            attention_mask = batch['attention_mask']  # Shape: (1, num_paragraphs, max_len)
-            paragraphs = batch['paragraphs']
-            example_id = batch['id'][0]
-            question = batch['question']
-            
-            # Step 1: Paragraph selection using the paragraph selection model
-            paragraph_selection_outputs = paragraph_selection_model(input_ids=input_ids, attention_mask=attention_mask)
-            
-            # Select the paragraph with the highest score across the paragraphs
-            selected_paragraph_idx = torch.argmax(paragraph_selection_outputs.logits[0], dim=-1).item()
+    with open(context_file, 'r', encoding='utf-8') as f:
+        context_data = json.load(f)
 
-            # Get the selected paragraph
-            selected_paragraph = paragraphs[selected_paragraph_idx]
-            
-            # Step 2: Use the span prediction model to predict the answer span within the selected paragraph
-            span_inputs = tokenizer(
-                question,
-                selected_paragraph,
-                truncation=True,               # Truncate input if it exceeds max length
-                max_length=512,                # Ensure that the input doesn't exceed 512 tokens
-                padding="max_length",           # Pad the sequence to max length
-                return_tensors="pt"             # Return tensors
-            ).to(device)
+    # Load tokenizer and models for both tasks
+    tokenizer = BertTokenizerFast.from_pretrained(span_prediction_model_path)
+    paragraph_selection_model = BertForQuestionAnswering.from_pretrained(paragraph_selection_model_path)
+    span_prediction_model = BertForQuestionAnswering.from_pretrained(span_prediction_model_path)
 
-            # Separate the input for the span prediction model
-            input_ids = span_inputs['input_ids']
-            attention_mask = span_inputs['attention_mask']
+    # Create dataset and dataloader
+    test_dataset = TestQADataset(test_data, context_data, tokenizer, max_len)
+    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-            # Run the span prediction model
+    # Run inference for both tasks
+    results = []
+    paragraph_selection_model.eval()
+    span_prediction_model.eval()
+
+    for batch in tqdm(test_dataloader, desc="Running inference"):
+        question_id = batch['id']  # Get question ID
+        question = batch['question']
+        paragraphs = batch['paragraphs']
+        tokenized_paragraphs = batch['tokenized_paragraphs']
+
+        # Step 1: Paragraph Selection
+        best_paragraph_score = float('-inf')
+        best_paragraph_idx = 0
+        for idx, inputs in enumerate(tokenized_paragraphs):
+            input_ids = inputs['input_ids'].squeeze(0).to(paragraph_selection_model.device)
+            attention_mask = inputs['attention_mask'].squeeze(0).to(paragraph_selection_model.device)
+
+            # Get logits for paragraph selection
+            with torch.no_grad():
+                outputs = paragraph_selection_model(input_ids=input_ids, attention_mask=attention_mask)
+                score = outputs.start_logits.mean().item()  # Using average of logits as a simple score
+
+            # Select the best paragraph
+            if score > best_paragraph_score:
+                best_paragraph_score = score
+                best_paragraph_idx = idx
+
+        # Step 2: Span Prediction on the Selected Paragraph
+        selected_paragraph = paragraphs[best_paragraph_idx]
+        tokenized_selected_paragraph = tokenized_paragraphs[best_paragraph_idx]
+        input_ids = tokenized_selected_paragraph['input_ids'].squeeze(0).to(span_prediction_model.device)
+        attention_mask = tokenized_selected_paragraph['attention_mask'].squeeze(0).to(span_prediction_model.device)
+
+        # Predict answer span
+        with torch.no_grad():
             outputs = span_prediction_model(input_ids=input_ids, attention_mask=attention_mask)
+            start_logits = outputs.start_logits.squeeze(0)
+            end_logits = outputs.end_logits.squeeze(0)
 
-            # Get the predicted start and end indices
-            start_idx = torch.argmax(outputs.start_logits, dim=-1).item()
-            end_idx = torch.argmax(outputs.end_logits, dim=-1).item()
+        # Post-process to extract the answer
+        start_idx = torch.argmax(start_logits).item()
+        end_idx = torch.argmax(end_logits).item()
 
-            # Extract the predicted answer from the selected paragraph using the token indices
-            tokens = tokenizer.convert_ids_to_tokens(input_ids.squeeze().tolist()[start_idx:end_idx + 1])
-
-            # Remove special tokens like [CLS], [SEP], [PAD]
-            cleaned_tokens = remove_special_tokens(tokens)
-
-            # Join tokens without spaces, remove '##'
-            predicted_answer = ''.join(cleaned_tokens).replace('##', '')
-
-            if predicted_answer == '':
-                print(f"No answer found for question: {question}")
-                print(f"    Selected Paragraph: {selected_paragraph}")
-                print(f"    Start Index: {start_idx}, End Index: {end_idx}")
-                print(f"    Tokens: {tokens}")
-                print(f"    Cleaned Tokens: {cleaned_tokens}")
-
-            # Append the id and the predicted answer to predictions
-            predictions.append({
-                'id': example_id,
-                'answer': predicted_answer
-            })
+        # Decode answer from tokenized input
+        print(input_ids[0][start_idx:end_idx + 1])
+        answer_tokens = tokenizer.convert_ids_to_tokens(input_ids[0][start_idx:end_idx + 1].cpu().numpy())
+        # Remove special tokens like [CLS], [SEP], [PAD]
+        cleaned_tokens = remove_special_tokens(answer_tokens)
+        answer = tokenizer.convert_tokens_to_string(cleaned_tokens)
+        # Join tokens without spaces, remove '##'
+        answer = ''.join(cleaned_tokens).replace('##', '')
+        print(f"Question: {question}, Answer: {answer}, Start: {start_idx}, End: {end_idx}")
+        results.append({
+            'id': question_id,  # Include the question ID in the results
+            'answer': answer,
+        })
 
     # Convert predictions to a pandas DataFrame and save as CSV
-    df = pd.DataFrame(predictions)
+    df = pd.DataFrame(results)
     df.to_csv(output_file, index=False)
 
-# Run prediction and save results
-predict_and_save_csv(paragraph_selection_model, span_prediction_model, tokenizer, test_dataset, 'submission.csv')
+    print(f"Inference completed. Results saved to {output_file}")
 
-print("Predictions saved to submission.csv")
+
+# Example usage of the inference script
+if __name__ == "__main__":
+    run_inference(
+        test_file='dataset/test.json',
+        context_file='dataset/context.json',
+        paragraph_selection_model_path='paragraph_selection_model',
+        span_prediction_model_path='span_prediction_model',
+        output_file='submission.csv',
+        max_len=512,
+        batch_size=1
+    )

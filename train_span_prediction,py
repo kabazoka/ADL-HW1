@@ -8,7 +8,8 @@ from transformers import (
 )
 from accelerate import Accelerator
 from tqdm.auto import tqdm
-from sample_code.utils_qa import postprocess_qa_predictions  # Postprocessing from Hugging Face
+from collections import OrderedDict
+import numpy as np
 
 # Custom dataset class
 class QAWithParagraphSelectionDataset(torch.utils.data.Dataset):
@@ -21,7 +22,7 @@ class QAWithParagraphSelectionDataset(torch.utils.data.Dataset):
 
     def _preprocess(self):
         preprocessed = []
-        for item in tqdm(self.data, desc="Processing Dataset", unit="samples"):
+        for idx, item in enumerate(tqdm(self.data, desc="Processing Dataset", unit="samples")):
             question = item['question']
             relevant_paragraph = self.context_data[item['relevant']].strip()
             answer_text = item['answer']['text']
@@ -44,11 +45,11 @@ class QAWithParagraphSelectionDataset(torch.utils.data.Dataset):
 
             # Find start and end token positions for the answer
             start_position, end_position = None, None
-            for idx, (start, end) in enumerate(offset_mapping):
+            for idx_tok, (start, end) in enumerate(offset_mapping):
                 if start <= answer_start < end:
-                    start_position = idx
+                    start_position = idx_tok
                 if start < answer_start + len(answer_text) <= end:
-                    end_position = idx
+                    end_position = idx_tok
             if start_position is None or end_position is None:
                 start_position, end_position = 0, 0
 
@@ -56,7 +57,12 @@ class QAWithParagraphSelectionDataset(torch.utils.data.Dataset):
                 'input_ids': input_ids,
                 'attention_mask': attention_mask,
                 'start_positions': torch.tensor(start_position, dtype=torch.long),
-                'end_positions': torch.tensor(end_position, dtype=torch.long)
+                'end_positions': torch.tensor(end_position, dtype=torch.long),
+                'offset_mapping': offset_mapping,
+                'context': relevant_paragraph,
+                'question': question,
+                'answer_text': answer_text,
+                'example_id': idx  # Keep track of example IDs
             })
 
         return preprocessed
@@ -72,7 +78,21 @@ def load_json(filepath):
     with open(filepath, 'r', encoding='utf-8') as f:
         return json.load(f)
 
-# Training function with checkpointing and evaluation
+# Evaluation metrics
+def compute_exact(a_gold, a_pred):
+    return int(a_gold == a_pred)
+
+def compute_f1(a_gold, a_pred):
+    gold_tokens = a_gold.split()
+    pred_tokens = a_pred.split()
+    common = set(gold_tokens) & set(pred_tokens)
+    if not common:
+        return 0.0
+    precision = len(common) / len(pred_tokens)
+    recall = len(common) / len(gold_tokens)
+    f1 = 2 * (precision * recall) / (precision + recall)
+    return f1
+
 def train_and_evaluate(
         train_file, valid_file, context_file, model_name_or_path, output_dir, 
         learning_rate=3e-5, num_epochs=3, batch_size=4, max_len=512, mixed_precision="fp16"):
@@ -93,20 +113,34 @@ def train_and_evaluate(
     # Initialize Accelerator
     accelerator = Accelerator(mixed_precision=mixed_precision)
 
-    # DataLoader with dynamic padding using DataCollatorWithPadding
-    data_collator = DataCollatorWithPadding(tokenizer)
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=data_collator)
-    valid_dataloader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False, collate_fn=data_collator)
+    # Implement custom collate function
+    def custom_collate_fn(features):
+        batch = {}
+        # Fields that need to be collated and padded
+        tensor_fields = ['input_ids', 'attention_mask', 'start_positions', 'end_positions', 'offset_mapping']
+        # Fields that are lists of strings or other data
+        non_tensor_fields = ['context', 'question', 'answer_text', 'example_id']
+        
+        for field in tensor_fields:
+            batch[field] = torch.stack([f[field] for f in features])
+        
+        for field in non_tensor_fields:
+            batch[field] = [f[field] for f in features]
+        
+        return batch
+
+    # Use the custom collate function
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=custom_collate_fn)
+    valid_dataloader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate_fn)
 
     # Optimizer and Scheduler
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     num_training_steps = num_epochs * len(train_dataloader)
     lr_scheduler = get_scheduler("linear", optimizer=optimizer, num_warmup_steps=500, num_training_steps=num_training_steps)
 
-    # Prepare model, dataloaders, and optimizer with accelerator
-    model, optimizer, train_dataloader, valid_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, valid_dataloader, lr_scheduler
-    )
+    # Prepare model, optimizer, and data loaders
+    model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
+    train_dataloader, valid_dataloader = accelerator.prepare(train_dataloader, valid_dataloader)
 
     # Training loop
     best_val_loss = float("inf")
@@ -116,7 +150,17 @@ def train_and_evaluate(
         model.train()
         total_loss = 0
         for batch in train_dataloader:
-            outputs = model(**batch)
+            input_ids = batch['input_ids'].to(accelerator.device)
+            attention_mask = batch['attention_mask'].to(accelerator.device)
+            start_positions = batch['start_positions'].to(accelerator.device)
+            end_positions = batch['end_positions'].to(accelerator.device)
+
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                start_positions=start_positions,
+                end_positions=end_positions
+            )
             loss = outputs.loss
             total_loss += loss.item()
             accelerator.backward(loss)
@@ -131,27 +175,65 @@ def train_and_evaluate(
         # Validation phase
         model.eval()
         total_val_loss = 0
-        correct_start_preds, correct_end_preds, total_predictions = 0, 0, 0
+        total_predictions = 0
+        exact_match_total = 0
+        f1_total = 0
+
         for batch in valid_dataloader:
             with torch.no_grad():
-                outputs = model(**batch)
+                input_ids = batch['input_ids'].to(accelerator.device)
+                attention_mask = batch['attention_mask'].to(accelerator.device)
+                start_positions = batch['start_positions'].to(accelerator.device)
+                end_positions = batch['end_positions'].to(accelerator.device)
+
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    start_positions=start_positions,
+                    end_positions=end_positions
+                )
                 val_loss = outputs.loss
                 total_val_loss += val_loss.item()
 
-                start_preds = torch.argmax(outputs.start_logits, dim=-1)
-                end_preds = torch.argmax(outputs.end_logits, dim=-1)
+                start_logits = outputs.start_logits.cpu().numpy()
+                end_logits = outputs.end_logits.cpu().numpy()
+                offset_mapping = batch['offset_mapping'].cpu().numpy()
+                contexts = batch['context']  # Non-tensor fields
+                answer_texts = batch['answer_text']
 
-                correct_start_preds += (start_preds == batch['start_positions']).sum().item()
-                correct_end_preds += (end_preds == batch['end_positions']).sum().item()
-                total_predictions += batch['start_positions'].size(0)
+                for i in range(len(start_logits)):
+                    # Get the best start and end logits positions
+                    start_idx = np.argmax(start_logits[i])
+                    end_idx = np.argmax(end_logits[i])
+
+                    # Correction for end_idx less than start_idx
+                    if end_idx < start_idx:
+                        end_idx = start_idx
+
+                    # Get the predicted answer text
+                    offsets = offset_mapping[i]
+                    start_char = offsets[start_idx][0]
+                    end_char = offsets[end_idx][1]
+                    predicted_answer = contexts[i][start_char:end_char]
+
+                    # Get the ground truth answer text
+                    ground_truth = answer_texts[i]
+
+                    # Compute Exact Match and F1
+                    exact_match = compute_exact(ground_truth, predicted_answer)
+                    f1 = compute_f1(ground_truth, predicted_answer)
+
+                    exact_match_total += exact_match
+                    f1_total += f1
+                    total_predictions += 1
 
         avg_val_loss = total_val_loss / len(valid_dataloader)
-        start_accuracy = correct_start_preds / total_predictions * 100
-        end_accuracy = correct_end_preds / total_predictions * 100
+        exact_match_score = exact_match_total / total_predictions * 100
+        f1_score = f1_total / total_predictions * 100
 
         print(f"Validation Loss after Epoch {epoch+1}: {avg_val_loss}")
-        print(f"Start Position Accuracy: {start_accuracy:.2f}%")
-        print(f"End Position Accuracy: {end_accuracy:.2f}%")
+        print(f"Exact Match Score: {exact_match_score:.2f}%")
+        print(f"F1 Score: {f1_score:.2f}%")
 
         # Checkpointing if validation loss improves
         if avg_val_loss < best_val_loss:
@@ -173,7 +255,7 @@ train_and_evaluate(
     output_dir="./span_prediction_model",
     learning_rate=3e-5,
     num_epochs=3,
-    batch_size=4,
+    batch_size=2,
     max_len=512,
     mixed_precision="fp16"
 )
