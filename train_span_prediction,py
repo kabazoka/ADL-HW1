@@ -3,177 +3,186 @@ import os
 import torch
 from torch.utils.data import DataLoader
 from transformers import (
-    BertTokenizerFast, BertForQuestionAnswering, get_scheduler, DataCollatorWithPadding,
-    AutoTokenizer, AutoModelForQuestionAnswering, default_data_collator
+    AutoTokenizer, AutoModelForQuestionAnswering, get_scheduler, DataCollatorWithPadding
 )
 from accelerate import Accelerator
 from tqdm.auto import tqdm
-from collections import OrderedDict
 import numpy as np
+from datasets import Dataset, load_metric
 
-# Custom dataset class
-class QAWithParagraphSelectionDataset(torch.utils.data.Dataset):
-    def __init__(self, data, context_data, tokenizer, max_len):
-        self.data = data
-        self.context_data = context_data
-        self.tokenizer = tokenizer
-        self.max_len = max_len
-        self.preprocessed_data = self._preprocess()
-
-    def _preprocess(self):
-        preprocessed = []
-        for idx, item in enumerate(tqdm(self.data, desc="Processing Dataset", unit="samples")):
-            question = item['question']
-            relevant_paragraph = self.context_data[item['relevant']].strip()
-            answer_text = item['answer']['text']
-            answer_start = item['answer']['start']
-
-            # Tokenize context separately to find the start and end positions
-            tokenized_context = self.tokenizer(
-                relevant_paragraph,
-                add_special_tokens=False,
-                return_offsets_mapping=True
-            )
-            context_offsets = tokenized_context['offset_mapping']
-            context_input_ids = tokenized_context['input_ids']
-
-            # Find start and end token positions in the context
-            start_position, end_position = None, None
-            for idx_tok, (start, end) in enumerate(context_offsets):
-                if start <= answer_start < end:
-                    start_position = idx_tok
-                if start <= answer_start + len(answer_text) <= end:
-                    end_position = idx_tok
-            if start_position is None:
-                start_position = 0
-            if end_position is None:
-                end_position = len(context_offsets) - 1
-
-            # Tokenize question and context together
-            inputs = self.tokenizer(
-                question,
-                relevant_paragraph,
-                truncation='only_second',
-                max_length=self.max_len,
-                padding="max_length",
-                return_offsets_mapping=True,
-                return_tensors="pt"
-            )
-
-            input_ids = inputs['input_ids'].squeeze(0)
-            attention_mask = inputs['attention_mask'].squeeze(0)
-            offset_mapping = inputs['offset_mapping'].squeeze(0)
-
-            # Adjust offset mapping: set offsets to (0, 0) for question and special tokens
-            sequence_ids = inputs.sequence_ids()
-            adjusted_offset_mapping = []
-            context_start = None
-            for idx_offset, (offset, seq_id) in enumerate(zip(offset_mapping, sequence_ids)):
-                if seq_id == 1:
-                    if context_start is None:
-                        context_start = idx_offset
-                    adjusted_offset_mapping.append((offset[0].item(), offset[1].item()))
-                else:
-                    adjusted_offset_mapping.append((0, 0))
-
-            # Adjust start and end positions
-            start_position += context_start
-            end_position += context_start
-
-            # Ensure that the positions are within the valid range
-            if start_position >= self.max_len:
-                start_position = self.max_len - 1
-            if end_position >= self.max_len:
-                end_position = self.max_len - 1
-
-            preprocessed.append({
-                'input_ids': input_ids,
-                'attention_mask': attention_mask,
-                'start_positions': torch.tensor(start_position, dtype=torch.long),
-                'end_positions': torch.tensor(end_position, dtype=torch.long),
-                'offset_mapping': torch.tensor(adjusted_offset_mapping),
-                'context': relevant_paragraph,
-                'question': question,
-                'answer_text': answer_text,
-                'example_id': idx  # Keep track of example IDs
-            })
-
-        return preprocessed
-
-    def __len__(self):
-        return len(self.preprocessed_data)
-
-    def __getitem__(self, idx):
-        return self.preprocessed_data[idx]
-
-# Dataset loading function
+# Load JSON data function
 def load_json(filepath):
     with open(filepath, 'r', encoding='utf-8') as f:
         return json.load(f)
 
-# Evaluation metrics
-def compute_exact(a_gold, a_pred):
-    return int(a_gold == a_pred)
+# Normalize answers function
+import re
+import string
 
-def compute_f1(a_gold, a_pred):
-    gold_tokens = a_gold.split()
-    pred_tokens = a_pred.split()
-    common = set(gold_tokens) & set(pred_tokens)
-    if not common:
-        return 0.0
-    precision = len(common) / len(pred_tokens)
-    recall = len(common) / len(gold_tokens)
-    f1 = 2 * (precision * recall) / (precision + recall)
-    return f1
+def normalize_answer(s):
+    """Lower text and remove punctuation, articles, and extra whitespace."""
+    def remove_punctuation(text):
+        return ''.join(ch for ch in text if ch not in set(string.punctuation))
 
+    def lower(text):
+        return text.lower()
+
+    def white_space_fix(text):
+        return ' '.join(text.split())
+
+    return white_space_fix(remove_punctuation(lower(s)))
+
+# Training and evaluation function
 def train_and_evaluate(
         train_file, valid_file, context_file, model_name_or_path, output_dir, 
-        learning_rate=3e-5, num_epochs=3, batch_size=4, max_len=512, mixed_precision="fp16"):
+        learning_rate=3e-5, num_epochs=3, batch_size=4, max_len=512, doc_stride=128, mixed_precision="fp16"):
     
     # Load datasets
     train_data = load_json(train_file)
     valid_data = load_json(valid_file)
     context_data = load_json(context_file)
     
+    # Prepare data in Hugging Face datasets format
+    def prepare_qa_dataset(data):
+        new_data = {'id': [], 'question': [], 'context': [], 'answers': []}
+        for idx, item in enumerate(data):
+            question = item['question']
+            relevant_paragraph = context_data[item['relevant']].strip()
+            answer_text = item['answer']['text']
+            answer_start = item['answer']['start']
+            new_data['id'].append(str(idx))
+            new_data['question'].append(question)
+            new_data['context'].append(relevant_paragraph)
+            new_data['answers'].append({'text': [answer_text], 'answer_start': [answer_start]})
+        return Dataset.from_dict(new_data)
+    
+    train_dataset = prepare_qa_dataset(train_data)
+    valid_dataset = prepare_qa_dataset(valid_data)
+    
     # Load tokenizer and model
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
-    model = BertForQuestionAnswering.from_pretrained(model_name_or_path)
+    model = AutoModelForQuestionAnswering.from_pretrained(model_name_or_path)
     
-    # Create datasets
-    train_dataset = QAWithParagraphSelectionDataset(train_data, context_data, tokenizer, max_len=max_len)
-    valid_dataset = QAWithParagraphSelectionDataset(valid_data, context_data, tokenizer, max_len=max_len)
-    
+    # Preprocessing the datasets
+    def prepare_train_features(examples):
+        tokenized_examples = tokenizer(
+            examples['question'],
+            examples['context'],
+            truncation="only_second",
+            max_length=max_len,
+            stride=doc_stride,
+            return_overflowing_tokens=True,
+            return_offsets_mapping=True,
+            padding="max_length",
+        )
+
+        sample_mapping = tokenized_examples.pop("overflow_to_sample_mapping")
+        offset_mapping = tokenized_examples.pop("offset_mapping")
+
+        tokenized_examples["start_positions"] = []
+        tokenized_examples["end_positions"] = []
+
+        for i, offsets in enumerate(offset_mapping):
+            input_ids = tokenized_examples["input_ids"][i]
+            cls_index = input_ids.index(tokenizer.cls_token_id)
+
+            sequence_ids = tokenized_examples.sequence_ids(i)
+            sample_index = sample_mapping[i]
+            answers = examples["answers"][sample_index]
+
+            if len(answers["answer_start"]) == 0:
+                tokenized_examples["start_positions"].append(cls_index)
+                tokenized_examples["end_positions"].append(cls_index)
+            else:
+                start_char = answers["answer_start"][0]
+                end_char = start_char + len(answers["text"][0])
+
+                token_start_index = 0
+                while sequence_ids[token_start_index] != 1:
+                    token_start_index += 1
+
+                token_end_index = len(input_ids) - 1
+                while sequence_ids[token_end_index] != 1:
+                    token_end_index -= 1
+
+                if offsets[token_start_index][0] > end_char or offsets[token_end_index][1] < start_char:
+                    tokenized_examples["start_positions"].append(cls_index)
+                    tokenized_examples["end_positions"].append(cls_index)
+                else:
+                    while token_start_index < len(offsets) and offsets[token_start_index][0] <= start_char:
+                        token_start_index += 1
+                    tokenized_examples["start_positions"].append(token_start_index - 1)
+
+                    while offsets[token_end_index][1] >= end_char:
+                        token_end_index -= 1
+                    tokenized_examples["end_positions"].append(token_end_index + 1)
+
+        return tokenized_examples
+
+    def prepare_validation_features(examples):
+        tokenized_examples = tokenizer(
+            examples['question'],
+            examples['context'],
+            truncation="only_second",
+            max_length=max_len,
+            stride=doc_stride,
+            return_overflowing_tokens=True,
+            return_offsets_mapping=True,
+            padding="max_length",
+        )
+
+        sample_mapping = tokenized_examples.pop("overflow_to_sample_mapping")
+        tokenized_examples["example_id"] = []
+
+        for i in range(len(tokenized_examples["input_ids"])):
+            sequence_ids = tokenized_examples.sequence_ids(i)
+            context_index = 1
+
+            sample_index = sample_mapping[i]
+            tokenized_examples["example_id"].append(examples["id"][sample_index])
+
+            tokenized_examples["offset_mapping"][i] = [
+                (o if sequence_ids[k] == context_index else None)
+                for k, o in enumerate(tokenized_examples["offset_mapping"][i])
+            ]
+
+        return tokenized_examples
+
+    # Tokenize datasets
+    train_dataset = train_dataset.map(
+        prepare_train_features,
+        batched=True,
+        remove_columns=train_dataset.column_names,
+    )
+
+    valid_dataset = valid_dataset.map(
+        prepare_validation_features,
+        batched=True,
+        remove_columns=valid_dataset.column_names,
+    )
+
     # Initialize Accelerator
     accelerator = Accelerator(mixed_precision=mixed_precision)
+    
+    # Data collator
+    data_collator = DataCollatorWithPadding(tokenizer)
 
-    # Implement custom collate function
-    def custom_collate_fn(features):
-        batch = {}
-        # Fields that need to be collated and padded
-        tensor_fields = ['input_ids', 'attention_mask', 'start_positions', 'end_positions', 'offset_mapping']
-        # Fields that are lists of strings or other data
-        non_tensor_fields = ['context', 'question', 'answer_text', 'example_id']
-        
-        for field in tensor_fields:
-            batch[field] = torch.stack([f[field] for f in features])
-        
-        for field in non_tensor_fields:
-            batch[field] = [f[field] for f in features]
-        
-        return batch
-
-    # Use the custom collate function
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=custom_collate_fn)
-    valid_dataloader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate_fn)
+    # Data loaders
+    train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=batch_size, collate_fn=data_collator)
+    valid_dataloader = DataLoader(valid_dataset, batch_size=batch_size, collate_fn=data_collator)
 
     # Optimizer and Scheduler
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     num_training_steps = num_epochs * len(train_dataloader)
     lr_scheduler = get_scheduler("linear", optimizer=optimizer, num_warmup_steps=500, num_training_steps=num_training_steps)
 
-    # Prepare model, optimizer, and data loaders
-    model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
-    train_dataloader, valid_dataloader = accelerator.prepare(train_dataloader, valid_dataloader)
+    # Prepare everything with Accelerator
+    model, optimizer, train_dataloader, valid_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, valid_dataloader, lr_scheduler
+    )
+
+    # Metric
+    metric = load_metric("squad")
 
     # Training loop
     best_val_loss = float("inf")
@@ -183,16 +192,11 @@ def train_and_evaluate(
         model.train()
         total_loss = 0
         for batch in train_dataloader:
-            input_ids = batch['input_ids'].to(accelerator.device)
-            attention_mask = batch['attention_mask'].to(accelerator.device)
-            start_positions = batch['start_positions'].to(accelerator.device)
-            end_positions = batch['end_positions'].to(accelerator.device)
-
             outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                start_positions=start_positions,
-                end_positions=end_positions
+                input_ids=batch['input_ids'],
+                attention_mask=batch['attention_mask'],
+                start_positions=batch['start_positions'],
+                end_positions=batch['end_positions']
             )
             loss = outputs.loss
             total_loss += loss.item()
@@ -208,75 +212,109 @@ def train_and_evaluate(
         # Validation phase
         model.eval()
         total_val_loss = 0
-        total_predictions = 0
-        exact_match_total = 0
-        f1_total = 0
+        all_start_logits = []
+        all_end_logits = []
+        all_example_ids = []
 
         for batch in valid_dataloader:
             with torch.no_grad():
-                input_ids = batch['input_ids'].to(accelerator.device)
-                attention_mask = batch['attention_mask'].to(accelerator.device)
-                start_positions = batch['start_positions'].to(accelerator.device)
-                end_positions = batch['end_positions'].to(accelerator.device)
-
                 outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    start_positions=start_positions,
-                    end_positions=end_positions
+                    input_ids=batch['input_ids'],
+                    attention_mask=batch['attention_mask']
                 )
-                val_loss = outputs.loss
-                total_val_loss += val_loss.item()
-
-                start_logits = outputs.start_logits.cpu().numpy()
-                end_logits = outputs.end_logits.cpu().numpy()
-                offset_mapping = batch['offset_mapping'].cpu().numpy()
-                contexts = batch['context']  # Non-tensor fields
-                answer_texts = batch['answer_text']
-
-                for i in range(len(start_logits)):
-                    # Get the best start and end logits positions
-                    start_idx = np.argmax(start_logits[i])
-                    end_idx = np.argmax(end_logits[i])
-
-                    # Correction for end_idx less than start_idx
-                    if end_idx < start_idx:
-                        end_idx = start_idx
-
-                    # Get the predicted answer text
-                    offsets = offset_mapping[i]
-                    start_char = offsets[start_idx][0]
-                    end_char = offsets[end_idx][1]
-                    predicted_answer = contexts[i][start_char:end_char]
-
-                    # Get the ground truth answer text
-                    ground_truth = answer_texts[i]
-
-                    # Compute Exact Match and F1
-                    exact_match = compute_exact(ground_truth, predicted_answer)
-                    f1 = compute_f1(ground_truth, predicted_answer)
-
-                    exact_match_total += exact_match
-                    f1_total += f1
-                    total_predictions += 1
-                    # Print predicted and ground truth answers
-                    print(f"Ground Truth: {ground_truth}")
-                    print(f"Predicted Answer: {predicted_answer}")
+                start_logits = accelerator.gather(outputs.start_logits).cpu().numpy()
+                end_logits = accelerator.gather(outputs.end_logits).cpu().numpy()
+                total_val_loss += outputs.loss.item() if 'loss' in outputs else 0.0
+                example_ids = batch["example_id"]
+                all_start_logits.append(start_logits)
+                all_end_logits.append(end_logits)
+                all_example_ids.extend(example_ids)
 
         avg_val_loss = total_val_loss / len(valid_dataloader)
-        exact_match_score = exact_match_total / total_predictions * 100
-        f1_score = f1_total / total_predictions * 100
-
         print(f"Validation Loss after Epoch {epoch+1}: {avg_val_loss}")
-        print(f"Exact Match Score: {exact_match_score:.2f}%")
-        print(f"F1 Score: {f1_score:.2f}%")
+
+        # Post-processing to get predictions
+        max_answer_length = 30
+        n_best_size = 20
+
+        # Flatten logits
+        all_start_logits = np.concatenate(all_start_logits, axis=0)
+        all_end_logits = np.concatenate(all_end_logits, axis=0)
+
+        # Build example to features mapping
+        example_id_to_index = {k: i for i, k in enumerate(valid_dataset["example_id"])}
+        features_per_example = {}
+        for i, example_id in enumerate(all_example_ids):
+            if example_id not in features_per_example:
+                features_per_example[example_id] = []
+            features_per_example[example_id].append(i)
+
+        # Get predictions
+        predictions = {}
+        references = []
+        for example in valid_data:
+            example_id = str(valid_data.index(example))
+            context = context_data[example['relevant']].strip()
+            answers = example['answer']['text']
+            answers_start = example['answer']['start']
+            gold_answers = [a.strip() for a in [answers] if a.strip()]
+            references.append({'id': example_id, 'answers': {'text': gold_answers, 'answer_start': [answers_start]}})
+
+            feature_indices = features_per_example.get(example_id, [])
+            valid_answers = []
+
+            for feature_index in feature_indices:
+                start_logits = all_start_logits[feature_index]
+                end_logits = all_end_logits[feature_index]
+                offset_mapping = valid_dataset[feature_index]['offset_mapping']
+
+                start_indexes = np.argsort(start_logits)[-1 : -n_best_size - 1 : -1].tolist()
+                end_indexes = np.argsort(end_logits)[-1 : -n_best_size - 1 : -1].tolist()
+
+                for start_index in start_indexes:
+                    for end_index in end_indexes:
+                        if start_index >= len(offset_mapping) or end_index >= len(offset_mapping):
+                            continue
+                        if offset_mapping[start_index] is None or offset_mapping[end_index] is None:
+                            continue
+                        if end_index < start_index or end_index - start_index + 1 > max_answer_length:
+                            continue
+
+                        start_char = offset_mapping[start_index][0]
+                        end_char = offset_mapping[end_index][1]
+                        predicted_answer = context[start_char:end_char]
+                        valid_answers.append({
+                            'score': start_logits[start_index] + end_logits[end_index],
+                            'text': predicted_answer
+                        })
+
+            if valid_answers:
+                best_answer = max(valid_answers, key=lambda x: x['score'])
+                predictions[example_id] = best_answer['text']
+            else:
+                predictions[example_id] = ''
+
+            # Inspect predicted answers
+            print(f"Question: {example['question']}")
+            print(f"Ground Truth Answer: {gold_answers[0] if gold_answers else 'No Answer'}")
+            print(f"Predicted Answer: {predictions[example_id]}")
+            print('-' * 50)
+
+        # Normalize predictions and references
+        normalized_predictions = {k: normalize_answer(v) for k, v in predictions.items()}
+        normalized_references = [{'id': ref['id'], 'answers': {'text': [normalize_answer(ans) for ans in ref['answers']['text']], 'answer_start': ref['answers']['answer_start']}} for ref in references]
+
+        # Compute metrics
+        final_metric = metric.compute(predictions=normalized_predictions, references=normalized_references)
+        print(f"Exact Match Score: {final_metric['exact_match']:.2f}%")
+        print(f"F1 Score: {final_metric['f1']:.2f}%")
 
         # Checkpointing if validation loss improves
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             accelerator.wait_for_everyone()
             unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.save_pretrained(output_dir)
+            unwrapped_model.save_pretrained(output_dir, save_function=accelerator.save)
             tokenizer.save_pretrained(output_dir)
             print(f"Best model saved with validation loss: {best_val_loss}")
 
@@ -287,11 +325,12 @@ train_and_evaluate(
     train_file='dataset/train.json',
     valid_file='dataset/valid.json',
     context_file='dataset/context.json',
-    model_name_or_path="bert-base-chinese",
+    model_name_or_path="hfl/chinese-roberta-wwm-ext",
     output_dir="./span_prediction_model",
     learning_rate=3e-5,
     num_epochs=3,
     batch_size=2,
     max_len=512,
+    doc_stride=128,
     mixed_precision="fp16"
 )
