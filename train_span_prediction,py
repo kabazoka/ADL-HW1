@@ -103,7 +103,7 @@ def train_and_evaluate(
     context_data = load_json(context_file)
     
     # Load tokenizer and model
-    tokenizer = BertTokenizerFast.from_pretrained(model_name_or_path)
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
     model = BertForQuestionAnswering.from_pretrained(model_name_or_path)
     
     # Create datasets
