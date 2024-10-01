@@ -8,7 +8,7 @@ from transformers import (
 from accelerate import Accelerator
 from tqdm.auto import tqdm
 import numpy as np
-from datasets import Dataset, load_metric
+from datasets import Dataset
 import evaluate
 
 # Load JSON data function
