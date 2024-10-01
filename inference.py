@@ -1,7 +1,7 @@
 import json
 import torch
-from transformers import AutoTokenizer, AutoModelForQuestionAnswering
 from torch.utils.data import DataLoader
+from transformers import AutoTokenizer, AutoModelForMultipleChoice, AutoModelForQuestionAnswering
 from tqdm.auto import tqdm
 from datasets import Dataset
 import pandas as pd
@@ -13,19 +13,7 @@ def load_test_data(test_file, context_file):
         test_data = json.load(f)
     with open(context_file, 'r', encoding='utf-8') as f:
         context_data = json.load(f)
-    
-    examples = {'id': [], 'question': [], 'context': []}
-    for item in test_data:
-        question_id = item['id']
-        question = item['question']
-        paragraphs = [context_data[p].strip() for p in item['paragraphs']]
-        # We process each paragraph separately
-        for idx, paragraph in enumerate(paragraphs):
-            example_id = f"{question_id}_{idx}"
-            examples['id'].append(example_id)
-            examples['question'].append(question)
-            examples['context'].append(paragraph)
-    return Dataset.from_dict(examples)
+    return test_data, context_data
 
 # Normalize answers function
 import re
@@ -45,20 +33,128 @@ def normalize_answer(s):
     return white_space_fix(remove_punctuation(lower(s)))
 
 # Inference function
-def run_inference(test_file, context_file, model_path, output_file, max_len=512, doc_stride=128, batch_size=8):
+def run_inference(test_file, context_file, paragraph_selection_model_path, span_prediction_model_path, output_file, max_len=512, doc_stride=128, batch_size=8):
     # Load the test dataset and context
-    test_dataset = load_test_data(test_file, context_file)
+    test_data, context_data = load_test_data(test_file, context_file)
     
-    # Load tokenizer and model
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model = AutoModelForQuestionAnswering.from_pretrained(model_path)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-    model.eval()
     
-    # Tokenize test data
+    # Load paragraph selection tokenizer and model
+    ps_tokenizer = AutoTokenizer.from_pretrained(paragraph_selection_model_path)
+    ps_model = AutoModelForMultipleChoice.from_pretrained(paragraph_selection_model_path)
+    ps_model.to(device)
+    ps_model.eval()
+    
+    # Load span prediction tokenizer and model
+    sp_tokenizer = AutoTokenizer.from_pretrained(span_prediction_model_path)
+    sp_model = AutoModelForQuestionAnswering.from_pretrained(span_prediction_model_path)
+    sp_model.to(device)
+    sp_model.eval()
+    
+    # Prepare data for paragraph selection
+    ps_examples = []
+    for item in test_data:
+        question = item['question']
+        paragraphs = [context_data[p].strip() for p in item['paragraphs']]
+        ps_examples.append({
+            'id': item['id'],
+            'question': question,
+            'paragraphs': paragraphs
+        })
+    ps_dataset = Dataset.from_list(ps_examples)
+    
+    # Preprocess function for paragraph selection
+    def ps_preprocess_function(examples):
+        first_sentences = [[question] * len(paragraphs) for question, paragraphs in zip(examples['question'], examples['paragraphs'])]
+        second_sentences = examples['paragraphs']
+
+        # Flatten
+        first_sentences = sum(first_sentences, [])
+        second_sentences = sum(second_sentences, [])
+
+        # Tokenize
+        tokenized_examples = ps_tokenizer(
+            first_sentences,
+            second_sentences,
+            truncation=True,
+            max_length=max_len,
+            padding="max_length",
+        )
+
+        # Un-flatten
+        num_choices = [len(paragraphs) for paragraphs in examples['paragraphs']]
+        tokenized_inputs = {k: [] for k in tokenized_examples.keys()}
+        index = 0
+        for n in num_choices:
+            for k in tokenized_examples.keys():
+                tokenized_inputs[k].append(tokenized_examples[k][index: index + n])
+            index += n
+        tokenized_inputs["id"] = examples["id"]
+        return tokenized_inputs
+
+    # Tokenize paragraph selection dataset
+    ps_dataset = ps_dataset.map(ps_preprocess_function, batched=True, remove_columns=ps_dataset.column_names)
+
+    # Data collator for paragraph selection
+    def ps_data_collator(features):
+        batch = {}
+        batch_size = len(features)
+        num_choices = [len(feature['input_ids']) for feature in features]
+
+        # Flatten features
+        flattened_input_ids = []
+        flattened_attention_mask = []
+        for feature in features:
+            flattened_input_ids.extend(feature['input_ids'])
+            flattened_attention_mask.extend(feature['attention_mask'])
+        # Pad and convert to tensors
+        batch['input_ids'] = torch.tensor(flattened_input_ids, dtype=torch.long)
+        batch['attention_mask'] = torch.tensor(flattened_attention_mask, dtype=torch.long)
+        batch['num_choices'] = num_choices
+        batch['id'] = [feature['id'] for feature in features]
+        return batch
+
+    # DataLoader for paragraph selection
+    ps_dataloader = DataLoader(ps_dataset, batch_size=batch_size, shuffle=False, collate_fn=ps_data_collator)
+
+    # Inference for paragraph selection
+    question_to_selected_paragraph = {}
+    for batch in tqdm(ps_dataloader, desc="Running paragraph selection"):
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        num_choices = batch['num_choices']
+        ids = batch['id']
+        # Split input_ids and attention_mask according to num_choices
+        input_ids_list = torch.split(input_ids, num_choices)
+        attention_mask_list = torch.split(attention_mask, num_choices)
+        for i in range(len(ids)):
+            input_ids_i = input_ids_list[i].unsqueeze(0)
+            attention_mask_i = attention_mask_list[i].unsqueeze(0)
+            with torch.no_grad():
+                outputs = ps_model(
+                    input_ids=input_ids_i,
+                    attention_mask=attention_mask_i
+                )
+                logits = outputs.logits
+                prediction = torch.argmax(logits, dim=-1).item()
+                question_to_selected_paragraph[ids[i]] = prediction
+
+    # Prepare data for span prediction
+    sp_examples = {'id': [], 'question': [], 'context': []}
+    for item in test_data:
+        question_id = item['id']
+        question = item['question']
+        paragraphs = [context_data[p].strip() for p in item['paragraphs']]
+        selected_index = question_to_selected_paragraph[question_id]
+        selected_paragraph = paragraphs[selected_index]
+        sp_examples['id'].append(question_id)
+        sp_examples['question'].append(question)
+        sp_examples['context'].append(selected_paragraph)
+    sp_dataset = Dataset.from_dict(sp_examples)
+
+    # Tokenize span prediction data
     def prepare_test_features(examples):
-        tokenized_examples = tokenizer(
+        tokenized_examples = sp_tokenizer(
             examples['question'],
             examples['context'],
             truncation="only_second",
@@ -87,59 +183,79 @@ def run_inference(test_file, context_file, model_path, output_file, max_len=512,
 
         return tokenized_examples
 
-    tokenized_dataset = test_dataset.map(
+    tokenized_dataset = sp_dataset.map(
         prepare_test_features,
         batched=True,
-        remove_columns=test_dataset.column_names,
+        remove_columns=sp_dataset.column_names,
     )
 
-    # DataLoader
-    data_collator = DataLoader(tokenized_dataset, batch_size=batch_size)
-    
-    # Inference
+    # Custom collate function for span prediction
+    def sp_data_collator(features):
+        batch = {}
+        # Fields to be converted to tensors
+        tensor_keys = {'input_ids', 'attention_mask'}
+        # Fields to be kept as lists
+        list_keys = {'offset_mapping', 'example_id'}
+
+        for key in features[0].keys():
+            if key in tensor_keys:
+                batch[key] = torch.stack([torch.tensor(f[key]) for f in features])
+            elif key in list_keys:
+                batch[key] = [f[key] for f in features]
+            else:
+                # Handle any other keys if necessary
+                pass
+        return batch
+
+    # DataLoader for span prediction
+    sp_dataloader = DataLoader(tokenized_dataset, batch_size=batch_size, collate_fn=sp_data_collator)
+
+    # Inference for span prediction
     all_start_logits = []
     all_end_logits = []
     all_example_ids = []
-    
-    for batch in tqdm(data_collator, desc="Running inference"):
+    all_offset_mappings = []
+
+    for batch in tqdm(sp_dataloader, desc="Running span prediction"):
         # Move inputs to device
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
         with torch.no_grad():
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            outputs = sp_model(input_ids=input_ids, attention_mask=attention_mask)
             start_logits = outputs.start_logits.cpu().numpy()
             end_logits = outputs.end_logits.cpu().numpy()
             all_start_logits.append(start_logits)
             all_end_logits.append(end_logits)
             all_example_ids.extend(batch["example_id"])
-    
+            all_offset_mappings.extend(batch["offset_mapping"])
+
     # Flatten logits
     all_start_logits = np.concatenate(all_start_logits, axis=0)
     all_end_logits = np.concatenate(all_end_logits, axis=0)
-    
+
     # Post-processing to get predictions
     max_answer_length = 30
     n_best_size = 20
 
     # Build example to features mapping
-    example_id_to_index = {k: i for i, k in enumerate(tokenized_dataset['example_id'])}
     features_per_example = {}
-    for i, example_id in enumerate(tokenized_dataset['example_id']):
+    for i, example_id in enumerate(all_example_ids):
         if example_id not in features_per_example:
             features_per_example[example_id] = []
         features_per_example[example_id].append(i)
 
-    predictions = {}
-    
-    for example_id in tqdm(set(tokenized_dataset['example_id']), desc="Post-processing predictions"):
-        feature_indices = features_per_example[example_id]
-        context = test_dataset[int(example_id_to_index[example_id])]['context']
+    predictions = []
+
+    for example in tqdm(sp_examples['id'], desc="Post-processing predictions"):
+        example_id = example
+        context = sp_examples['context'][sp_examples['id'].index(example_id)]
+        feature_indices = features_per_example.get(example_id, [])
         valid_answers = []
 
         for feature_index in feature_indices:
             start_logits = all_start_logits[feature_index]
             end_logits = all_end_logits[feature_index]
-            offset_mapping = tokenized_dataset[feature_index]['offset_mapping']
+            offset_mapping = all_offset_mappings[feature_index]
             
             start_indexes = np.argsort(start_logits)[-1 : -n_best_size -1 : -1].tolist()
             end_indexes = np.argsort(end_logits)[-1 : -n_best_size -1 : -1].tolist()
@@ -163,39 +279,18 @@ def run_inference(test_file, context_file, model_path, output_file, max_len=512,
                     })
         if valid_answers:
             best_answer = max(valid_answers, key=lambda x: x['score'])
-            predictions[example_id] = best_answer['text']
+            pred_text = best_answer['text']
         else:
-            predictions[example_id] = ''
+            pred_text = ''
 
-    # Now, consolidate predictions for each question
-    question_id_to_answers = {}
-
-    for example_id, answer in predictions.items():
-        question_id = example_id.rsplit('_', 1)[0]  # Remove paragraph index
-        if question_id not in question_id_to_answers:
-            question_id_to_answers[question_id] = []
-        question_id_to_answers[question_id].append({
-            'answer': answer,
-            'score': 0  # Placeholder; we can sum the scores if needed
-        })
-
-    # For each question, select the best answer among all paragraphs
-    final_predictions = []
-    for question_id, answers in question_id_to_answers.items():
-        # Filter out empty answers and normalize
-        non_empty_answers = [normalize_answer(ans['answer']) for ans in answers if ans['answer'].strip()]
-        if non_empty_answers:
-            # Choose the most frequent answer or the first one
-            final_answer = max(set(non_empty_answers), key=non_empty_answers.count)
-        else:
-            final_answer = ''
-        final_predictions.append({
-            'id': question_id,
-            'answer': final_answer
+        # Append prediction
+        predictions.append({
+            'id': example_id,
+            'answer': pred_text
         })
 
     # Convert predictions to a pandas DataFrame and save as CSV
-    df = pd.DataFrame(final_predictions)
+    df = pd.DataFrame(predictions)
     df.to_csv(output_file, index=False)
     print(f"Inference completed. Results saved to {output_file}")
 
@@ -204,7 +299,8 @@ if __name__ == "__main__":
     run_inference(
         test_file='dataset/test.json',
         context_file='dataset/context.json',
-        model_path='span_prediction_model',
+        paragraph_selection_model_path='paragraph_selection_model_roberta',
+        span_prediction_model_path='span_prediction_model',
         output_file='submission.csv',
         max_len=512,
         doc_stride=128,

@@ -9,6 +9,7 @@ from accelerate import Accelerator
 from tqdm.auto import tqdm
 import numpy as np
 from datasets import Dataset, load_metric
+import evaluate
 
 # Load JSON data function
 def load_json(filepath):
@@ -141,6 +142,7 @@ def train_and_evaluate(
             sample_index = sample_mapping[i]
             tokenized_examples["example_id"].append(examples["id"][sample_index])
 
+            # Set to None the offset mappings that are not part of the context
             tokenized_examples["offset_mapping"][i] = [
                 (o if sequence_ids[k] == context_index else None)
                 for k, o in enumerate(tokenized_examples["offset_mapping"][i])
@@ -164,12 +166,30 @@ def train_and_evaluate(
     # Initialize Accelerator
     accelerator = Accelerator(mixed_precision=mixed_precision)
     
-    # Data collator
+    # Data collator for training
     data_collator = DataCollatorWithPadding(tokenizer)
+
+    # Custom collate function for evaluation
+    def custom_eval_collate_fn(features):
+        batch = {}
+        # Fields to be converted to tensors
+        tensor_keys = {'input_ids', 'attention_mask'}
+        # Fields to be kept as lists
+        list_keys = {'offset_mapping', 'example_id'}
+
+        for key in features[0].keys():
+            if key in tensor_keys:
+                batch[key] = torch.stack([torch.tensor(f[key]) for f in features])
+            elif key in list_keys:
+                batch[key] = [f[key] for f in features]
+            else:
+                # Ignore other keys or handle appropriately
+                pass
+        return batch
 
     # Data loaders
     train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=batch_size, collate_fn=data_collator)
-    valid_dataloader = DataLoader(valid_dataset, batch_size=batch_size, collate_fn=data_collator)
+    valid_dataloader = DataLoader(valid_dataset, batch_size=batch_size, collate_fn=custom_eval_collate_fn)
 
     # Optimizer and Scheduler
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
@@ -182,12 +202,13 @@ def train_and_evaluate(
     )
 
     # Metric
-    metric = load_metric("squad")
+    metric = evaluate.load("squad")
 
     # Training loop
     best_val_loss = float("inf")
     progress_bar = tqdm(range(num_training_steps))
 
+    best_f1 = 0
     for epoch in range(num_epochs):
         model.train()
         total_loss = 0
@@ -215,6 +236,7 @@ def train_and_evaluate(
         all_start_logits = []
         all_end_logits = []
         all_example_ids = []
+        all_offset_mappings = []
 
         for batch in valid_dataloader:
             with torch.no_grad():
@@ -224,22 +246,20 @@ def train_and_evaluate(
                 )
                 start_logits = accelerator.gather(outputs.start_logits).cpu().numpy()
                 end_logits = accelerator.gather(outputs.end_logits).cpu().numpy()
-                total_val_loss += outputs.loss.item() if 'loss' in outputs else 0.0
                 example_ids = batch["example_id"]
+                offset_mappings = batch["offset_mapping"]
                 all_start_logits.append(start_logits)
                 all_end_logits.append(end_logits)
                 all_example_ids.extend(example_ids)
-
-        avg_val_loss = total_val_loss / len(valid_dataloader)
-        print(f"Validation Loss after Epoch {epoch+1}: {avg_val_loss}")
-
-        # Post-processing to get predictions
-        max_answer_length = 30
-        n_best_size = 20
+                all_offset_mappings.extend(offset_mappings)
 
         # Flatten logits
         all_start_logits = np.concatenate(all_start_logits, axis=0)
         all_end_logits = np.concatenate(all_end_logits, axis=0)
+
+        # Post-processing to get predictions
+        max_answer_length = 30
+        n_best_size = 20
 
         # Build example to features mapping
         example_id_to_index = {k: i for i, k in enumerate(valid_dataset["example_id"])}
@@ -249,16 +269,18 @@ def train_and_evaluate(
                 features_per_example[example_id] = []
             features_per_example[example_id].append(i)
 
+        # Initialize lists for predictions and references
+        predictions_list = []
+        references_list = []
+
         # Get predictions
-        predictions = {}
-        references = []
         for example in valid_data:
             example_id = str(valid_data.index(example))
             context = context_data[example['relevant']].strip()
             answers = example['answer']['text']
             answers_start = example['answer']['start']
             gold_answers = [a.strip() for a in [answers] if a.strip()]
-            references.append({'id': example_id, 'answers': {'text': gold_answers, 'answer_start': [answers_start]}})
+            references_list.append({'id': example_id, 'answers': {'text': gold_answers, 'answer_start': [answers_start]}})
 
             feature_indices = features_per_example.get(example_id, [])
             valid_answers = []
@@ -266,7 +288,7 @@ def train_and_evaluate(
             for feature_index in feature_indices:
                 start_logits = all_start_logits[feature_index]
                 end_logits = all_end_logits[feature_index]
-                offset_mapping = valid_dataset[feature_index]['offset_mapping']
+                offset_mapping = all_offset_mappings[feature_index]
 
                 start_indexes = np.argsort(start_logits)[-1 : -n_best_size - 1 : -1].tolist()
                 end_indexes = np.argsort(end_logits)[-1 : -n_best_size - 1 : -1].tolist()
@@ -290,28 +312,27 @@ def train_and_evaluate(
 
             if valid_answers:
                 best_answer = max(valid_answers, key=lambda x: x['score'])
-                predictions[example_id] = best_answer['text']
+                pred_text = best_answer['text']
             else:
-                predictions[example_id] = ''
+                pred_text = ''
+
+            # Append prediction to the list
+            predictions_list.append({'id': example_id, 'prediction_text': pred_text})
 
             # Inspect predicted answers
             print(f"Question: {example['question']}")
             print(f"Ground Truth Answer: {gold_answers[0] if gold_answers else 'No Answer'}")
-            print(f"Predicted Answer: {predictions[example_id]}")
+            print(f"Predicted Answer: {pred_text}")
             print('-' * 50)
 
-        # Normalize predictions and references
-        normalized_predictions = {k: normalize_answer(v) for k, v in predictions.items()}
-        normalized_references = [{'id': ref['id'], 'answers': {'text': [normalize_answer(ans) for ans in ref['answers']['text']], 'answer_start': ref['answers']['answer_start']}} for ref in references]
-
         # Compute metrics
-        final_metric = metric.compute(predictions=normalized_predictions, references=normalized_references)
+        final_metric = metric.compute(predictions=predictions_list, references=references_list)
         print(f"Exact Match Score: {final_metric['exact_match']:.2f}%")
         print(f"F1 Score: {final_metric['f1']:.2f}%")
 
         # Checkpointing if validation loss improves
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
+        if final_metric['f1'] > best_f1:
+            best_f1 = final_metric['f1']
             accelerator.wait_for_everyone()
             unwrapped_model = accelerator.unwrap_model(model)
             unwrapped_model.save_pretrained(output_dir, save_function=accelerator.save)
