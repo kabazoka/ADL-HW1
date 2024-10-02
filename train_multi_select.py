@@ -7,7 +7,7 @@ from transformers import (
 from accelerate import Accelerator
 from tqdm.auto import tqdm
 from datasets import Dataset as HFDataset
-from datasets import load_metric
+import evaluate
 
 # Load the datasets
 def load_json(filepath):
@@ -116,7 +116,7 @@ model, optimizer, train_dataloader, valid_dataloader, lr_scheduler = accelerator
 )
 
 # Metric
-metric = load_metric("accuracy")
+metric = evaluate.load("squad")
 
 # Training loop
 progress_bar = tqdm(range(num_training_steps), disable=not accelerator.is_local_main_process)
