@@ -299,7 +299,7 @@ if __name__ == "__main__":
     run_inference(
         test_file='dataset/test.json',
         context_file='dataset/context.json',
-        paragraph_selection_model_path='paragraph_selection_model_roberta',
+        paragraph_selection_model_path='paragraph_selection_model',
         span_prediction_model_path='span_prediction_model',
         output_file='submission.csv',
         max_len=512,
