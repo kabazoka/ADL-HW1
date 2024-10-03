@@ -10,7 +10,7 @@ command_exists () {
 # Install gdown if not already installed
 if ! command_exists gdown ; then
     echo "gdown could not be found. Installing gdown..."
-    pip install gdown
+    python3 -m pip install gdown
 fi
 
 # Replace 'YOUR_ZIP_FILE_ID' with the actual file ID from Google Drive
@@ -19,7 +19,7 @@ ZIP_FILE_ID=14fZEAIKTNDNof_rh6WMjCodMkPvrspxg
 
 # Download the zip file
 echo "Downloading the zip file containing inference.py and models..."
-gdown --id $ZIP_FILE_ID -O models_and_code.zip
+python3 -m gdown --id $ZIP_FILE_ID -O models_and_code.zip
 
 # Unzip the file
 echo "Extracting the zip file..."

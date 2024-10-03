@@ -6,6 +6,7 @@ from tqdm.auto import tqdm
 from datasets import Dataset
 import pandas as pd
 import numpy as np
+import argparse
 
 # Function to load and prepare test data
 def load_test_data(test_file, context_file):
@@ -294,15 +295,26 @@ def run_inference(test_file, context_file, paragraph_selection_model_path, span_
     df.to_csv(output_file, index=False)
     print(f"Inference completed. Results saved to {output_file}")
 
-# Example usage
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Inference script for QA system')
+    parser.add_argument('--test_file', type=str, required=True, help='Path to the test.json file')
+    parser.add_argument('--context_file', type=str, required=True, help='Path to the context.json file')
+    parser.add_argument('--paragraph_selection_model_path', type=str, required=True, help='Path to the paragraph selection model directory')
+    parser.add_argument('--span_prediction_model_path', type=str, required=True, help='Path to the span prediction model directory')
+    parser.add_argument('--output_file', type=str, required=True, help='Path to the output prediction file (e.g., prediction.csv)')
+    parser.add_argument('--max_len', type=int, default=512, help='Maximum sequence length')
+    parser.add_argument('--doc_stride', type=int, default=128, help='Document stride for sliding window')
+    parser.add_argument('--batch_size', type=int, default=8, help='Batch size for inference')
+
+    args = parser.parse_args()
+
     run_inference(
-        test_file='dataset/test.json',
-        context_file='dataset/context.json',
-        paragraph_selection_model_path='paragraph_selection_model',
-        span_prediction_model_path='span_prediction_model',
-        output_file='submission.csv',
-        max_len=512,
-        doc_stride=128,
-        batch_size=8
+        test_file=args.test_file,
+        context_file=args.context_file,
+        paragraph_selection_model_path=args.paragraph_selection_model_path,
+        span_prediction_model_path=args.span_prediction_model_path,
+        output_file=args.output_file,
+        max_len=args.max_len,
+        doc_stride=args.doc_stride,
+        batch_size=args.batch_size
     )

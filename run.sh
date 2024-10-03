@@ -25,7 +25,7 @@ OUTPUT_FILE=$3
 # source activate qa_env
 
 # Run the inference script
-python inference.py \
+python3 inference.py \
     --context_file "$CONTEXT_FILE" \
     --test_file "$TEST_FILE" \
     --output_file "$OUTPUT_FILE" \
