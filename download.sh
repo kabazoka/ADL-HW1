@@ -1,22 +1,29 @@
 #!/bin/bash
 
+# This script downloads the zip file containing inference.py and the models from Google Drive and extracts it.
+
+# Function to check if a command exists
+command_exists () {
+    command -v "$1" &> /dev/null ;
+}
+
 # Install gdown if not already installed
-if ! command -v gdown &> /dev/null
-then
-    echo "gdown could not be found, installing..."
+if ! command_exists gdown ; then
+    echo "gdown could not be found. Installing gdown..."
     pip install gdown
 fi
 
-# Google Drive file IDs
-FILE_ID_1="model1.pt"
-FILE_ID_2="model2.pt"
+# Replace 'YOUR_ZIP_FILE_ID' with the actual file ID from Google Drive
+# https://drive.google.com/file/d/14fZEAIKTNDNof_rh6WMjCodMkPvrspxg/view?usp=share_link
+ZIP_FILE_ID=14fZEAIKTNDNof_rh6WMjCodMkPvrspxg
 
-# Output file names
-OUTPUT_1="model1.pt"
-OUTPUT_2="model2.pt"
+# Download the zip file
+echo "Downloading the zip file containing inference.py and models..."
+gdown --id $ZIP_FILE_ID -O models_and_code.zip
 
-# Download the files
-gdown --id $FILE_ID_1 -O $OUTPUT_1
-gdown --id $FILE_ID_2 -O $OUTPUT_2
+# Unzip the file
+echo "Extracting the zip file..."
+unzip -o models_and_code.zip
+rm models_and_code.zip
 
-echo "Download completed."
+echo "Download and extraction complete."
