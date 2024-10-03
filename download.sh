@@ -14,8 +14,8 @@ if ! command_exists gdown ; then
 fi
 
 # Replace 'YOUR_ZIP_FILE_ID' with the actual file ID from Google Drive
-# https://drive.google.com/file/d/14fZEAIKTNDNof_rh6WMjCodMkPvrspxg/view?usp=share_link
-ZIP_FILE_ID=14fZEAIKTNDNof_rh6WMjCodMkPvrspxg
+# https://drive.google.com/file/d/15IcrG7DWwPjqEKBCbzt3H6TLtXu9J8bL/view?usp=sharing
+ZIP_FILE_ID=15IcrG7DWwPjqEKBCbzt3H6TLtXu9J8bL
 
 # Download the zip file
 echo "Downloading the zip file containing inference.py and models..."
