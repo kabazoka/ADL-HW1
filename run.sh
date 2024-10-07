@@ -4,6 +4,7 @@
 
 # Usage:
 # bash ./run.sh /path/to/context.json /path/to/test.json /path/to/prediction.csv
+# bash ./run.sh dateset/context.json dateset/test.json dateset/prediction.csv
 
 # Arguments:
 # $1: path to context.json

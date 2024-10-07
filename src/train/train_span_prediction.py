@@ -346,11 +346,11 @@ train_and_evaluate(
     train_file='dataset/train.json',
     valid_file='dataset/valid.json',
     context_file='dataset/context.json',
-    model_name_or_path="hfl/chinese-roberta-wwm-ext",
+    model_name_or_path="hfl/chinese-bert-wwm-ext",
     output_dir="./span_prediction_model",
     learning_rate=3e-5,
     num_epochs=3,
-    batch_size=2,
+    batch_size=8,
     max_len=512,
     doc_stride=128,
     mixed_precision="fp16"
