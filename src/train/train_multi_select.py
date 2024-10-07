@@ -165,9 +165,9 @@ for epoch in range(num_epochs):
         best_accuracy = accuracy
         accelerator.wait_for_everyone()
         unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained("./paragraph_selection_model_roberta", save_function=accelerator.save)
+        unwrapped_model.save_pretrained("./paragraph_selection_model", save_function=accelerator.save)
         if accelerator.is_main_process:
-            tokenizer.save_pretrained("./paragraph_selection_model_roberta")
+            tokenizer.save_pretrained("./paragraph_selection_model")
         print(f"Best model saved with accuracy: {best_accuracy:.2f}%")
 
 print("Training completed.")

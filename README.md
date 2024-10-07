@@ -88,7 +88,7 @@ The dataset structure should be as follows:
 Train the paragraph selection model to select the most relevant paragraph for each question.
 
 ```bash
-python train_paragraph_selection.py
+python src/train/train_paragraph_selection.py
 ```
 
 This script performs the following:
@@ -104,7 +104,7 @@ This script performs the following:
 Train the span prediction model to predict the answer span within the selected paragraph.
 
 ```bash
-python train_span_prediction.py
+python src/train/train_span_prediction.py
 ```
 
 This script performs the following:
@@ -120,7 +120,7 @@ This script performs the following:
 Run the inference script to generate predictions on the test dataset.
 
 ```bash
-python inference.py
+python src/inference/inference.py
 ```
 
 The script performs the following:
