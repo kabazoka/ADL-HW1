@@ -10,6 +10,7 @@ from tqdm.auto import tqdm
 import numpy as np
 from datasets import Dataset
 import evaluate
+import matplotlib.pyplot as plt  # Importing Matplotlib
 
 # Load JSON data function
 def load_json(filepath):
@@ -120,6 +121,7 @@ def train_and_evaluate(
 
         return tokenized_examples
 
+    # For validation, we need start_positions and end_positions to compute validation loss
     def prepare_validation_features(examples):
         tokenized_examples = tokenizer(
             examples['question'],
@@ -133,9 +135,13 @@ def train_and_evaluate(
         )
 
         sample_mapping = tokenized_examples.pop("overflow_to_sample_mapping")
-        tokenized_examples["example_id"] = []
+        offset_mapping = tokenized_examples["offset_mapping"]  # Keep offset mapping
 
-        for i in range(len(tokenized_examples["input_ids"])):
+        tokenized_examples["example_id"] = []
+        tokenized_examples["start_positions"] = []
+        tokenized_examples["end_positions"] = []
+
+        for i, offsets in enumerate(offset_mapping):
             sequence_ids = tokenized_examples.sequence_ids(i)
             context_index = 1
 
@@ -143,10 +149,53 @@ def train_and_evaluate(
             tokenized_examples["example_id"].append(examples["id"][sample_index])
 
             # Set to None the offset mappings that are not part of the context
-            tokenized_examples["offset_mapping"][i] = [
+            offset_mapping[i] = [
                 (o if sequence_ids[k] == context_index else None)
-                for k, o in enumerate(tokenized_examples["offset_mapping"][i])
+                for k, o in enumerate(offsets)
             ]
+
+            # Compute start and end positions
+            answers = examples["answers"][sample_index]
+
+            if len(answers["answer_start"]) == 0:
+                # No answer case
+                tokenized_examples["start_positions"].append(0)
+                tokenized_examples["end_positions"].append(0)
+            else:
+                start_char = answers["answer_start"][0]
+                end_char = start_char + len(answers["text"][0])
+
+                # Find the start token index
+                token_start_index = 0
+                while token_start_index < len(offset_mapping[i]) and (
+                    offset_mapping[i][token_start_index] is None or
+                    offset_mapping[i][token_start_index][0] <= start_char
+                ):
+                    token_start_index += 1
+                token_start_index -= 1
+
+                # Find the end token index
+                token_end_index = len(offset_mapping[i]) - 1
+                while token_end_index >= 0 and (
+                    offset_mapping[i][token_end_index] is None or
+                    offset_mapping[i][token_end_index][1] >= end_char
+                ):
+                    token_end_index -= 1
+                token_end_index += 1
+
+                # If the answer is not fully inside the context, label it as (0, 0)
+                if token_start_index >= len(offset_mapping[i]) or \
+                token_end_index >= len(offset_mapping[i]) or \
+                offset_mapping[i][token_start_index] is None or \
+                offset_mapping[i][token_end_index] is None or \
+                offset_mapping[i][token_start_index][0] > end_char or \
+                offset_mapping[i][token_end_index][1] < start_char:
+                    tokenized_examples["start_positions"].append(0)
+                    tokenized_examples["end_positions"].append(0)
+                else:
+                    # Otherwise, set the token positions
+                    tokenized_examples["start_positions"].append(token_start_index)
+                    tokenized_examples["end_positions"].append(token_end_index)
 
         return tokenized_examples
 
@@ -173,7 +222,7 @@ def train_and_evaluate(
     def custom_eval_collate_fn(features):
         batch = {}
         # Fields to be converted to tensors
-        tensor_keys = {'input_ids', 'attention_mask'}
+        tensor_keys = {'input_ids', 'attention_mask', 'start_positions', 'end_positions'}
         # Fields to be kept as lists
         list_keys = {'offset_mapping', 'example_id'}
 
@@ -204,11 +253,15 @@ def train_and_evaluate(
     # Metric
     metric = evaluate.load("squad")
 
+    # Lists to store metrics
+    train_losses = []
+    val_losses = []
+    exact_match_scores = []
+
     # Training loop
-    best_val_loss = float("inf")
+    best_f1 = 0
     progress_bar = tqdm(range(num_training_steps))
 
-    best_f1 = 0
     for epoch in range(num_epochs):
         model.train()
         total_loss = 0
@@ -228,6 +281,7 @@ def train_and_evaluate(
             progress_bar.update(1)
 
         avg_train_loss = total_loss / len(train_dataloader)
+        train_losses.append(avg_train_loss)
         print(f"Epoch {epoch+1} finished with average training loss: {avg_train_loss}")
 
         # Validation phase
@@ -242,8 +296,13 @@ def train_and_evaluate(
             with torch.no_grad():
                 outputs = model(
                     input_ids=batch['input_ids'],
-                    attention_mask=batch['attention_mask']
+                    attention_mask=batch['attention_mask'],
+                    start_positions=batch['start_positions'],
+                    end_positions=batch['end_positions']
                 )
+                loss = outputs.loss
+                total_val_loss += loss.item()
+
                 start_logits = accelerator.gather(outputs.start_logits).cpu().numpy()
                 end_logits = accelerator.gather(outputs.end_logits).cpu().numpy()
                 example_ids = batch["example_id"]
@@ -252,6 +311,10 @@ def train_and_evaluate(
                 all_end_logits.append(end_logits)
                 all_example_ids.extend(example_ids)
                 all_offset_mappings.extend(offset_mappings)
+
+        avg_val_loss = total_val_loss / len(valid_dataloader)
+        val_losses.append(avg_val_loss)
+        print(f"Epoch {epoch+1} finished with average validation loss: {avg_val_loss}")
 
         # Flatten logits
         all_start_logits = np.concatenate(all_start_logits, axis=0)
@@ -262,7 +325,6 @@ def train_and_evaluate(
         n_best_size = 20
 
         # Build example to features mapping
-        example_id_to_index = {k: i for i, k in enumerate(valid_dataset["example_id"])}
         features_per_example = {}
         for i, example_id in enumerate(all_example_ids):
             if example_id not in features_per_example:
@@ -319,37 +381,74 @@ def train_and_evaluate(
             # Append prediction to the list
             predictions_list.append({'id': example_id, 'prediction_text': pred_text})
 
-            # Inspect predicted answers
-            print(f"Question: {example['question']}")
-            print(f"Ground Truth Answer: {gold_answers[0] if gold_answers else 'No Answer'}")
-            print(f"Predicted Answer: {pred_text}")
-            print('-' * 50)
+            # Optional: Inspect predicted answers
+            # print(f"Question: {example['question']}")
+            # print(f"Ground Truth Answer: {gold_answers[0] if gold_answers else 'No Answer'}")
+            # print(f"Predicted Answer: {pred_text}")
+            # print('-' * 50)
 
         # Compute metrics
         final_metric = metric.compute(predictions=predictions_list, references=references_list)
-        print(f"Exact Match Score: {final_metric['exact_match']:.2f}%")
-        print(f"F1 Score: {final_metric['f1']:.2f}%")
+        exact_match = final_metric['exact_match']
+        exact_match_scores.append(exact_match)
+        print(f"Epoch {epoch+1}: Exact Match Score: {exact_match:.2f}%")
+        print(f"Epoch {epoch+1}: F1 Score: {final_metric['f1']:.2f}%")
 
-        # Checkpointing if validation loss improves
+        # Checkpointing if F1 improves
         if final_metric['f1'] > best_f1:
             best_f1 = final_metric['f1']
             accelerator.wait_for_everyone()
             unwrapped_model = accelerator.unwrap_model(model)
             unwrapped_model.save_pretrained(output_dir, save_function=accelerator.save)
             tokenizer.save_pretrained(output_dir)
-            print(f"Best model saved with validation loss: {best_val_loss}")
+            print(f"Best model saved with F1 score: {best_f1:.2f}%")
 
         model.train()
+
+    print("Training completed.")
+
+    # Plotting the learning curves
+    epochs = range(1, num_epochs + 1)
+
+    # Plotting Loss
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs, train_losses, 'b-', label='Training Loss')
+    plt.plot(epochs, val_losses, 'r-', label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Learning Curve - Loss')
+    plt.legend()
+
+    # Plotting Exact Match Score
+    plt.subplot(1, 2, 2)
+    plt.plot(epochs, exact_match_scores, 'g-', label='Exact Match Score')
+    plt.xlabel('Epoch')
+    plt.ylabel('Exact Match (%)')
+    plt.title('Learning Curve - Exact Match')
+    plt.legend()
+
+    plt.tight_layout()
+    plt.show()
+
+    # Documenting the losses and exact match scores in log.txt
+    with open(os.path.join(output_dir, 'log.txt'), 'w') as log_file:
+        log_file.write(f"Model: {model_name_or_path}\n")
+        log_file.write(f"Batch Size: {batch_size}\n")
+        log_file.write(f"Epochs: {num_epochs}\n")
+        log_file.write("Epoch\tTrain Loss\tValidation Loss\tExact Match Score\n")
+        for epoch in range(num_epochs):
+            log_file.write(f"{epoch + 1}\t{train_losses[epoch]:.4f}\t{val_losses[epoch]:.4f}\t{exact_match_scores[epoch]:.2f}\n")
 
 # Example usage
 train_and_evaluate(
     train_file='dataset/train.json',
     valid_file='dataset/valid.json',
     context_file='dataset/context.json',
-    model_name_or_path="hfl/chinese-bert-wwm-ext",
-    output_dir="./span_prediction_model",
+    model_name_or_path="hfl/chinese-macbert-base",
+    output_dir="./span_prediction_model_macbert",
     learning_rate=3e-5,
-    num_epochs=3,
+    num_epochs=5,
     batch_size=8,
     max_len=512,
     doc_stride=128,
