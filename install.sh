@@ -17,6 +17,6 @@ conda activate qa_env
 conda install pytorch torchvision torchaudio cudatoolkit=11.3 -c pytorch -y
 
 # Install Hugging Face Transformers, Datasets, and other dependencies
-pip install transformers datasets accelerate evaluate tqdm pandas numpy
+pip install -r requirements.txt
 
 echo "Environment setup complete. Activate the environment using 'conda activate qa_env'."
