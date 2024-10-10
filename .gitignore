@@ -7,4 +7,5 @@
 /span_prediction_model_roberta
 /span_prediction_model_bert
 /span_prediction_model_macbert
+/scratch_span_prediction_model
 submission.csv

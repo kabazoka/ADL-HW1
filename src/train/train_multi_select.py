@@ -180,7 +180,7 @@ train_and_evaluate(
     valid_data='dataset/valid.json',
     context_data='dataset/context.json',
     model_name_or_path="hfl/chinese-roberta-wwm-ext",
-    output_dir="./paragraph_selection_model_roberta",
+    output_dir="./paragraph_selection_model",
     learning_rate=3e-5,
     num_epochs=1,
     batch_size=2,
